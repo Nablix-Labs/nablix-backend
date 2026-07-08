@@ -99,13 +99,34 @@ async def submit_canvas_work(
         "transcript": transcript or None,
         "transcript_confidence": confidence,
     }
-    url = f"{MAIN_BACKEND_URL}/canvas/submit"
-    logger.info(f"[{session_id}] POST {url}")
-    async with httpx.AsyncClient(timeout=40.0) as client:
-        response = await client.post(url, json=payload)
+    logger.info(f"[{session_id}] POST {MAIN_BACKEND_URL}/canvas/submit")
+    response = await _backend_http_client.post("/canvas/submit", json=payload, timeout=40.0)
     if response.status_code != 200:
         raise RuntimeError(f"status={response.status_code} body={response.text}")
     return response.json()
+
+
+def _tutor_response_from_canvas(result: dict[str, object]) -> dict[str, object]:
+    tutor = result.get("tutor")
+    if not isinstance(tutor, dict):
+        raise RuntimeError("canvas response missing tutor object")
+
+    tutor_message = tutor.get("tutor_message")
+    if not isinstance(tutor_message, str) or tutor_message == "":
+        raise RuntimeError("canvas tutor response missing tutor_message")
+
+    tutor_message_voice = tutor.get("tutor_message_voice")
+    return {
+        "message": tutor_message,
+        "message_voice": tutor_message_voice if isinstance(tutor_message_voice, str) else tutor_message,
+    }
+
+
+def _canvas_draw_from(result: dict[str, object]) -> list[object]:
+    canvas_draw = result.get("canvas_draw")
+    if not isinstance(canvas_draw, list):
+        raise RuntimeError("canvas response missing canvas_draw list")
+    return canvas_draw
 
 
 async def synthesize_speech(text: str) -> str | None:
@@ -372,13 +393,25 @@ async def process_and_respond(
 
     try:
         tutor_start = time.time()
-        tutor_response = await evaluate_voice_transcript(
-            session_id,
-            student_id,
-            transcript,
-            confidence,
-            audio_duration_seconds,
-        )
+        canvas_draw: list[object] = []
+        if canvas_snapshot:
+            canvas_response = await submit_canvas_work(
+                session_id,
+                student_id,
+                canvas_snapshot,
+                transcript,
+                confidence,
+            )
+            tutor_response = _tutor_response_from_canvas(canvas_response)
+            canvas_draw = _canvas_draw_from(canvas_response)
+        else:
+            tutor_response = await evaluate_voice_transcript(
+                session_id,
+                student_id,
+                transcript,
+                confidence,
+                audio_duration_seconds,
+            )
         tutor_ms = int((time.time() - tutor_start) * 1000)
         logger.info(f"[{session_id}] Backend tutor call took {tutor_ms}ms")
     except Exception as e:
@@ -433,6 +466,7 @@ async def process_and_respond(
         "needs_clarification": confidence < voice_config.CONFIDENCE_THRESHOLD,
         "tts_latency_ms": tts_latency,
         "total_pipeline_ms": total_ms,
+        "canvas_draw": canvas_draw,
     })
 
     logger.info(f"[{session_id}] Pipeline complete: {total_ms}ms total")
