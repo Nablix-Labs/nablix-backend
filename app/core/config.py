@@ -1,6 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -19,7 +20,15 @@ class Settings(BaseSettings):
 
     #API Keys
     openai_api_key: str = ""
+    embedding_model: str = "text-embedding-3-small"
     vision_api_key: str = ""
+
+    # Shared Qdrant Cloud collection used by question selection and RAG retrieval
+    qdrant_url: str = ""
+    qdrant_api_key: str = ""
+    qdrant_collection: str = "math_tutor_content"
+    # Backend concept ids -> knowledge-base concept ids.
+    qdrant_concept_id_map: dict[str, str] = Field(default_factory=dict)
 
     #Mock flags - True during sprint
     # (the tutor has no flag: it always runs the in-process AI Engine)
