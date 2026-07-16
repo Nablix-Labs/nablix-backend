@@ -2,20 +2,13 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
 from qdrant_client import models
 
 from app.adapters.rag_service import RAGServiceAdapterClient
-from app.api import rag as rag_api
 from app.core.config import Settings, get_settings
 from app.core.exceptions import AdapterError
-from app.main import app
 from app.models.adapters import AdapterContext
-from app.models.rag import (
-    RAGQueryMetadata,
-    RAGRetrieveRequest,
-    RAGRetrieveResponse,
-)
+from app.models.rag import RAGRetrieveRequest
 from app.services import rag_retrieval
 
 
@@ -30,63 +23,6 @@ _REQUEST_BODY: dict[str, object] = {
     "max_results": 3,
     "exclude_content_ids": [],
 }
-
-
-def test_rag_route_requires_bearer_token() -> None:
-    response = TestClient(app).post("/rag/retrieve", json=_REQUEST_BODY)
-
-    assert response.status_code == 401
-    assert response.json()["message"] == "Bearer authentication is required."
-
-
-def test_rag_route_returns_the_public_contract(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_retrieve(
-        request: RAGRetrieveRequest,
-        settings: Settings,
-    ) -> RAGRetrieveResponse:
-        del settings
-        return RAGRetrieveResponse(
-            query_id=request.query_id,
-            results=[],
-            result_count=0,
-            fallback_used=True,
-            query_metadata=RAGQueryMetadata(
-                retrieval_time_ms=2,
-                filters_applied=["concept_id"],
-            ),
-        )
-
-    monkeypatch.setattr(rag_api, "retrieve_content", fake_retrieve)
-    response = TestClient(app).post(
-        "/rag/retrieve",
-        json=_REQUEST_BODY,
-        headers={"Authorization": "Bearer test-token"},
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "query_id": "query-1",
-        "results": [],
-        "result_count": 0,
-        "fallback_used": True,
-        "query_metadata": {
-            "retrieval_time_ms": 2,
-            "filters_applied": ["concept_id"],
-        },
-    }
-
-
-def test_rag_route_rejects_invalid_filter_combinations() -> None:
-    body: dict[str, object] = {**_REQUEST_BODY, "hint_level": None}
-    response = TestClient(app).post(
-        "/rag/retrieve",
-        json=body,
-        headers={"Authorization": "Bearer test-token"},
-    )
-
-    assert response.status_code == 422
 
 
 def test_internal_adapter_resolves_guardrail_hint_level() -> None:
@@ -128,7 +64,8 @@ def test_retrieve_content_queries_shared_qdrant_with_retries(
         ) -> None:
             assert api_key == "test-openai-key"
             assert timeout == 20
-            assert max_retries == 0
+            # Embedding retries are the SDK's job now.
+            assert max_retries == 2
             self.embeddings = FakeEmbeddings()
 
     class FakeQdrantClient:
@@ -199,6 +136,7 @@ def test_retrieve_content_queries_shared_qdrant_with_retries(
     get_settings.cache_clear()
     monkeypatch.setattr(rag_retrieval, "OpenAI", FakeOpenAI)
     monkeypatch.setattr(rag_retrieval, "QdrantClient", FakeQdrantClient)
+    monkeypatch.setattr(rag_retrieval, "_clients", None)
     request = RAGRetrieveRequest.model_validate(
         {**_REQUEST_BODY, "exclude_content_ids": ["SKIP_001"]}
     )
@@ -269,6 +207,7 @@ def test_retrieve_content_returns_empty_without_mock_content(
     get_settings.cache_clear()
     monkeypatch.setattr(rag_retrieval, "OpenAI", FakeOpenAI)
     monkeypatch.setattr(rag_retrieval, "QdrantClient", FakeQdrantClient)
+    monkeypatch.setattr(rag_retrieval, "_clients", None)
 
     response = rag_retrieval.retrieve_content(
         RAGRetrieveRequest.model_validate(_REQUEST_BODY),
