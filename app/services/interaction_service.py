@@ -143,10 +143,10 @@ def _current_hint_level_from(hint_count: int) -> int | None:
 
 
 def _independent_correct_in_session(session: SessionRecord) -> int:
+    # Unaided corrects in any phase — the same semantics as the classifier's
+    # independent_success flag, which Saravanan's promotion gate counts.
     return sum(
-        attempt.phase == session.current_phase
-        and attempt.evaluation == "CORRECT"
-        and attempt.hint_level_used == 0
+        attempt.evaluation == "CORRECT" and attempt.hint_level_used == 0
         for attempt in session.per_question_history
     )
 
@@ -362,8 +362,10 @@ async def process_interaction(
         rules.conversation_rules.max_recent_messages,
     )
 
-    # Chirudeva executes Tamil's recommendation; Sanya does not control progression.
-    recommended = student.recommended_entry_phase
+    completed = tutor.evaluation == "CORRECT"
+    # Chirudeva 6.7: Saravanan's recommendation is the only phase authority;
+    # resolve_transition guards against invalid or unrecognised moves.
+    recommended: str | None = student.recommended_entry_phase
     new_phase = resolve_transition(session.current_phase, recommended)
     logger.info(
         "phase_transition_evaluated",
@@ -376,7 +378,6 @@ async def process_interaction(
         },
     )
 
-    completed = tutor.evaluation == "CORRECT"
     next_hint_count: int = _next_hint_count_from(request)
     # Persisted every turn: the real attempt counter and completion state Sanya
     # reads back on the next turn.
@@ -384,7 +385,8 @@ async def process_interaction(
         "attempt_count": next_attempt_count,
         "question_completed": completed,
         "conversation_history": conversation_history,
-        "recommended_entry_phase": student.recommended_entry_phase,
+        "recommended_entry_phase": recommended,
+        "last_student_model": student,
     }
     if request.interaction_type == "ANSWER_SUBMISSION":
         state_updates["per_question_history"] = [
@@ -394,6 +396,7 @@ async def process_interaction(
                 question_text=session.current_question,
                 phase=session.current_phase,
                 evaluation=tutor.evaluation,
+                error_type=tutor.error_type if tutor.evaluation != "CORRECT" else None,
                 input_source=request.input_source,
                 hint_level_used=tutor.hint_level,
                 attempted_at=datetime.now(timezone.utc),
