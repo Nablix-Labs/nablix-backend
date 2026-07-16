@@ -24,6 +24,27 @@ _RETRIABLE_QDRANT_ERRORS = (
     UnexpectedResponse,
     httpx.HTTPError,
 )
+# Cached per process; serverless workers reuse them across warm invocations.
+_clients: tuple[OpenAI, QdrantClient] | None = None
+
+
+def _get_clients(settings: Settings) -> tuple[OpenAI, QdrantClient]:
+    global _clients
+    if _clients is None:
+        _clients = (
+            OpenAI(
+                api_key=settings.openai_api_key,
+                timeout=settings.openai_request_timeout_seconds,
+                # The SDK retries natively; no hand-rolled loop needed here.
+                max_retries=settings.adapter_request_retry_count,
+            ),
+            QdrantClient(
+                url=settings.qdrant_url,
+                api_key=settings.qdrant_api_key,
+                timeout=settings.adapter_request_timeout_seconds,
+            ),
+        )
+    return _clients
 
 
 def _require_settings(settings: Settings) -> None:
@@ -139,26 +160,18 @@ def retrieve_content(
         request.concept_id, request.concept_id
     )
     attempts: int = settings.adapter_request_retry_count + 1
-    openai_client = OpenAI(
-        api_key=settings.openai_api_key,
-        timeout=settings.openai_request_timeout_seconds,
-        max_retries=0,
-    )
-    embedding_response = _run_with_retries(
-        lambda: openai_client.embeddings.create(
+    openai_client, qdrant_client = _get_clients(settings)
+    try:
+        embedding_response = openai_client.embeddings.create(
             model=settings.embedding_model,
             input=_embedding_query(request, concept_id),
-        ),
-        "OpenAI embedding request",
-        attempts,
-        (APIError,),
-    )
+        )
+    except APIError as error:
+        raise AdapterError(
+            "rag_service",
+            f"OpenAI embedding request failed: {error}",
+        ) from error
     embedding: list[float] = embedding_response.data[0].embedding
-    qdrant_client = QdrantClient(
-        url=settings.qdrant_url,
-        api_key=settings.qdrant_api_key,
-        timeout=settings.adapter_request_timeout_seconds,
-    )
     query_filter, filters = _build_filter(request, concept_id)
     query_response = _run_with_retries(
         lambda: qdrant_client.query_points(
