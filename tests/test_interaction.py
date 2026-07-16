@@ -28,6 +28,7 @@ def _start_session(student_id: str, mode: str = "TEXT", **overrides) -> str:
         "student_id": student_id,
         "concept_id": "ALG_LINEAR_ONE_STEP",
         "interaction_mode": mode,
+        "initial_phase": "DIAGNOSTIC",
     }
     body.update(overrides)
     response = client.post("/session/start", json=body)
@@ -793,6 +794,7 @@ def test_session_end_summarises_recorded_activity(monkeypatch) -> None:
         ),
     )
     assert independent_attempt.status_code == 200
+    assert independent_attempt.json()["current_phase"] == "INDEPENDENT_PRACTICE"
 
     end = client.post(
         "/session/end",
