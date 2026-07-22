@@ -30,6 +30,12 @@ if voice_config.OPENAI_API_KEY:
 if voice_config.DEEPGRAM_API_KEY:
     import deepgram_tts_adapter
 
+if voice_config.CARTESIA_API_KEY:
+    import cartesia_tts_adapter
+
+if voice_config.INWORLD_API_KEY:
+    import inworld_tts_adapter
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -229,7 +235,7 @@ async def warm_tts_connection():
     """
     try:
         tts_adapter = get_tts_adapter(voice_config.DEFAULT_TTS_PROVIDER)
-        await tts_adapter.generate_speech(text=".", voice=voice_config.TTS_VOICE, audio_format="mp3")
+        await tts_adapter.generate_speech(text="hello", voice=voice_config.TTS_VOICE, audio_format="mp3")
         logger.info("TTS connection pre-warmed successfully")
     except Exception as e:
         logger.warning(f"TTS pre-warm failed (non-fatal): {e}")
