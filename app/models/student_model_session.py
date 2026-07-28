@@ -208,6 +208,10 @@ class DiagnosticQuestionSetRequestedEvent(SessionEventBase):
     event_type: Literal["DIAGNOSTIC_QUESTION_SET_REQUESTED"]
 
 
+class SessionOpenedEvent(SessionEventBase):
+    event_type: Literal["SESSION_OPENED"]
+
+
 class MicroSkillResult(BaseModel):
     micro_skill_id: str
     result: DiagnosticResult
@@ -266,7 +270,8 @@ class GuidedQuestionSetRequestedEvent(SessionEventBase):
 
 
 StudentModelSessionEvent: TypeAlias = (
-    DiagnosticQuestionSetRequestedEvent
+    SessionOpenedEvent
+    | DiagnosticQuestionSetRequestedEvent
     | DiagnosticCompletedEvent
     | WorkedExampleRequestedEvent
     | OrientationCompletedEvent

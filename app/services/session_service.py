@@ -28,9 +28,10 @@ from app.models.session import (
 from app.models.student_model_session import (
     DiagnosticResult,
     DiagnosticCompletedEvent,
-    DiagnosticQuestionSetRequestedEvent,
     MicroSkillResult,
     OrientationCompletedEvent,
+    SessionOpenedEvent,
+    StudentModelPhasePayload,
     StudentModelPhase,
     StudentModelQuestion,
     StudentModelSessionEventResponse,
@@ -246,7 +247,7 @@ async def start_session(
     request: SessionStartRequest,
     access_token: str,
 ) -> SessionRecord:
-    """Start Schema 3.0 diagnostic unless an explicit legacy phase was requested."""
+    """Open the authoritative Schema 3.0 journey unless a legacy phase was requested."""
 
     if request.initial_phase is not None:
         return await _start_legacy_session(request, request.initial_phase)
@@ -262,45 +263,39 @@ async def start_session(
     session_id = _build_session_id()
     started_at = datetime.now(timezone.utc)
     event = await get_adapters().student_model.send_session_event(
-        DiagnosticQuestionSetRequestedEvent(
-            request_id=f"{session_id}:DIAGNOSTIC_QUESTION_SET_REQUESTED",
-            event_type="DIAGNOSTIC_QUESTION_SET_REQUESTED",
+        SessionOpenedEvent(
+            request_id=f"{session_id}:SESSION_OPENED",
+            event_type="SESSION_OPENED",
             topic_id=topic_id,
             student_id=request.student_id,
             timestamp=started_at.isoformat().replace("+00:00", "Z"),
         ),
         access_token,
     )
-    _require_schema_phase(event, ("PHASE_0_DIAGNOSTIC",))
-    payload = event.phase_payload
-    if (
-        payload is None
-        or payload.payload_type != "QUESTION_SET"
-        or payload.question_set is None
-        or not payload.question_set.questions
-    ):
-        raise HTTPException(
-            status_code=503,
-            detail="Student Model returned no diagnostic questions.",
-        )
-    first = payload.question_set.questions[0]
+    payload = _validate_session_opened_payload(event)
     phase = PHASE_FROM_STUDENT_MODEL[payload.phase]
     flags = UI_STATE_FLAGS[phase]
-    question_ids = [question.question_id for question in payload.question_set.questions]
+    question_updates = _question_updates(event)
+    current_question = question_updates["current_question"]
+    recommended_phase = event.journey_state.recommended_entry_phase
     session = SessionRecord(
         session_id=session_id,
         student_id=request.student_id,
         concept_id=request.concept_id,
         started_at=started_at,
         current_phase=phase,
-        current_question=first.student_view.question_text,
-        question_id=first.question_id,
+        current_question=current_question,
+        question_id=question_updates["question_id"],
         question_number=1,
-        correct_answer=first.tutor_view.answer_spec.canonical_answer,
-        served_question_ids=question_ids,
+        correct_answer=question_updates["correct_answer"],
+        served_question_ids=question_updates.get("served_question_ids", []),
         interaction_mode=request.interaction_mode,
         ui_state=phase,
-        message=_diagnostic_start_message(first.student_view.question_text),
+        message=(
+            _diagnostic_start_message(current_question)
+            if phase == "DIAGNOSTIC" and isinstance(current_question, str)
+            else event.routing.reason
+        ),
         show_canvas=flags["show_canvas"],
         show_hint_button=flags["show_hint_button"],
         show_visual_cue=flags["show_visual_cue"],
@@ -309,12 +304,65 @@ async def start_session(
         allow_voice_input=flags["allow_voice_input"],
         hint_count=0,
         status="started",
-        recommended_entry_phase=phase,
+        recommended_entry_phase=(
+            PHASE_FROM_STUDENT_MODEL[recommended_phase]
+            if recommended_phase is not None
+            else None
+        ),
         student_model_event=event,
         student_model_state=project_student_model_state(event),
     )
     _sessions[session_id] = session
     return session
+
+
+def _validate_session_opened_payload(
+    event: StudentModelSessionEventResponse,
+) -> StudentModelPhasePayload:
+    payload = event.phase_payload
+    if payload is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Student Model returned no phase payload for SESSION_OPENED.",
+        )
+
+    expected_types: dict[StudentModelPhase, str] = {
+        "PHASE_0_DIAGNOSTIC": "QUESTION_SET",
+        "PHASE_1_ORIENTATION": "ORIENTATION_BUNDLE",
+        "PHASE_2_GUIDED_LEARNING": "QUESTION_SET",
+        "PHASE_3_INDEPENDENT_PRACTICE": "QUESTION_SET",
+        "REVIEW": "REVIEW_SUMMARY",
+    }
+    expected_type = expected_types[payload.phase]
+    if payload.payload_type != expected_type:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Student Model returned payload type {payload.payload_type} "
+                f"for {payload.phase}; expected {expected_type}."
+            ),
+        )
+    if expected_type == "QUESTION_SET" and (
+        payload.question_set is None or not payload.question_set.questions
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Student Model returned no questions for {payload.phase}.",
+        )
+    if expected_type == "ORIENTATION_BUNDLE" and (
+        payload.orientation_bundle is None
+        or not payload.orientation_bundle.delivery_sequence
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Student Model returned no orientation content.",
+        )
+    if expected_type == "REVIEW_SUMMARY" and payload.review_summary is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Student Model returned no review summary.",
+        )
+    return payload
 
 
 def _schema_session(session_id: str, student_id: str) -> SessionRecord:
