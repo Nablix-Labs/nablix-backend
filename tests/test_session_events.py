@@ -199,6 +199,28 @@ def _event_response(
                                 "duration_seconds": 75,
                             },
                             "worked_example": None,
+                        },
+                        {
+                            "sequence_no": 2,
+                            "content_type": "WORKED_EXAMPLE",
+                            "video": None,
+                            "worked_example": {
+                                "worked_example_id": "WE-KS3-T02-01",
+                                "title": "Many Cases, One General Rule",
+                                "covered_micro_skill_ids": ["T02.M1"],
+                                "final_answer": "n + 4",
+                                "student_answer_required": False,
+                                "steps": [
+                                    {
+                                        "step_id": "WE-KS3-T02-01-S01",
+                                        "sequence_no": 1,
+                                        "screen_content": "2 + 4",
+                                        "narration_text": "Start with one case.",
+                                        "must_show": None,
+                                        "must_not_show": None,
+                                    }
+                                ],
+                            },
                         }
                     ],
                 },
@@ -237,6 +259,28 @@ def _event_response(
                                 "duration_seconds": 75,
                             },
                             "worked_example": None,
+                        },
+                        {
+                            "sequence_no": 2,
+                            "content_type": "WORKED_EXAMPLE",
+                            "video": None,
+                            "worked_example": {
+                                "worked_example_id": "WE-KS3-T02-01",
+                                "title": "Many Cases, One General Rule",
+                                "covered_micro_skill_ids": ["T02.M1"],
+                                "final_answer": "n + 4",
+                                "student_answer_required": False,
+                                "steps": [
+                                    {
+                                        "step_id": "WE-KS3-T02-01-S01",
+                                        "sequence_no": 1,
+                                        "screen_content": "2 + 4",
+                                        "narration_text": "Start with one case.",
+                                        "must_show": None,
+                                        "must_not_show": None,
+                                    }
+                                ],
+                            },
                         }
                     ],
                 },
@@ -564,6 +608,24 @@ def test_session_start_uses_schema_3_diagnostic_contract_by_default(monkeypatch)
     assert body["current_phase"] == "DIAGNOSTIC"
     assert body["current_question"] == "What does 4y mean?"
     assert body["question_id"] == "Q-T02-D01"
+    assert body["show_canvas"] is False
+    assert body["show_hint_button"] is False
+    assert body["show_visual_cue"] is False
+    assert body["show_scaffold_panel"] is False
+    assert body["message"] == (
+        "I’ll ask you a few short questions to understand what you already know "
+        "about this topic. Select the answer you think is correct."
+    )
+    assert body["diagnostic_transition_message"] == "Okay. Let’s continue."
+    assert body["diagnostic_transition_messages"] == [
+        "Okay. Let’s continue with the next one.",
+        "Now, see what you think about this question.",
+        "Let’s try the next one.",
+        "Here’s another one for you to consider.",
+        "Take a look at this one and choose what you think is correct.",
+        "Ready for another? Try this one.",
+        "Let’s keep going with one more question.",
+    ]
     assert body["student_model_state"]["target_micro_skill_ids"] == [
         "T02.M1",
         "T02.M2",
@@ -575,6 +637,25 @@ def test_session_start_uses_schema_3_diagnostic_contract_by_default(monkeypatch)
         "T02.M8",
     ]
     assert len(body["student_model_event"]["phase_payload"]["question_set"]["questions"]) == 8
+    public_json = response.text
+    for private_field in (
+        "correct_answer",
+        "canonical_answer",
+        "accepted_answers",
+        "tutor_view",
+        "micro_skill_mappings",
+        "potential_errors",
+        "results_by_skill",
+        "weak_micro_skill_ids",
+        "reason_code",
+    ):
+        assert private_field not in public_json
+    stored = session_service._sessions[body["session_id"]]
+    assert stored.correct_answer == "B"
+    assert stored.student_model_event is not None
+    internal_question_set = stored.student_model_event.phase_payload.question_set
+    assert internal_question_set is not None
+    assert internal_question_set.questions[0].tutor_view.answer_spec.canonical_answer == "B"
     assert captured["url"] == "https://student-model.example/session/event"
     assert captured["headers"] == {"Authorization": "Bearer test-token"}
     payload = captured["payload"]
@@ -636,9 +717,6 @@ def test_session_start_restores_each_student_model_phase(
     assert body["question_id"] == expected_question_id
     assert body["recommended_entry_phase"] == expected_phase
     assert body["student_model_event"]["phase_payload"]["phase"] == student_model_phase
-    assert body["session_id"] != body["student_model_event"]["journey_state"][
-        "active_session_id"
-    ]
 
 
 def test_repeated_session_start_restores_authoritative_progress(
@@ -905,6 +983,19 @@ def test_restored_not_started_phase_initializes_before_answer(
         assert events[1]["used_question_ids"] == []
     else:
         assert events[1]["target_micro_skill_ids"] == ["T02.M1"]
+def test_student_model_request_ids_remain_unique_after_session_counter_restart() -> None:
+    first = session_service._student_model_request_id(
+        "SESSION001",
+        "DIAGNOSTIC_QUESTION_SET_REQUESTED",
+    )
+    second = session_service._student_model_request_id(
+        "SESSION001",
+        "DIAGNOSTIC_QUESTION_SET_REQUESTED",
+    )
+
+    assert first != second
+    assert first.startswith("SESSION001:DIAGNOSTIC_QUESTION_SET_REQUESTED:")
+    assert second.startswith("SESSION001:DIAGNOSTIC_QUESTION_SET_REQUESTED:")
 
 
 def test_diagnostic_and_orientation_lifecycle_uses_micro_skills(monkeypatch) -> None:
@@ -957,13 +1048,25 @@ def test_diagnostic_and_orientation_lifecycle_uses_micro_skills(monkeypatch) -> 
     assert diagnostic.status_code == 200
     assert diagnostic.json()["current_phase"] == "CONCEPT_ORIENTATION"
     assert diagnostic.json()["current_question"] is None
+    assert diagnostic.json()["message"] == (
+        "I found one idea that will be useful to look at before we continue. "
+        "Let’s watch a short explanation together."
+    )
+    assert diagnostic.json()["orientation_messages"]["before_video_message"] == (
+        "Watch how the numbers change and what stays the same. "
+        "You can pause or replay any part."
+    )
     assert events[-1]["micro_skill_results"] == [
         {"micro_skill_id": "T02.M1", "result": "INCORRECT"}
     ]
 
     premature_completion = client.post(
         f"/session/{session_id}/orientation/complete",
-        json={"student_id": "ST001"},
+        json={
+            "student_id": "ST001",
+            "completed_video_ids": [],
+            "completed_worked_example_ids": [],
+        },
     )
     assert premature_completion.status_code == 409
     assert len(events) == 2
@@ -974,10 +1077,30 @@ def test_diagnostic_and_orientation_lifecycle_uses_micro_skills(monkeypatch) -> 
     )
     assert orientation_started.status_code == 200
     assert events[-1]["target_micro_skill_ids"] == ["T02.M1"]
+    assert orientation_started.json()["message"] == (
+        "Watch how the numbers change and what stays the same. "
+        "You can pause or replay any part."
+    )
+
+    incomplete_orientation = client.post(
+        f"/session/{session_id}/orientation/complete",
+        json={
+            "student_id": "ST001",
+            "completed_video_ids": ["VID-KS3-T02-ORI"],
+            "completed_worked_example_ids": [],
+        },
+    )
+    assert incomplete_orientation.status_code == 409
+    assert "WE-KS3-T02-01" in incomplete_orientation.json()["message"]
+    assert len(events) == 3
 
     orientation_completed = client.post(
         f"/session/{session_id}/orientation/complete",
-        json={"student_id": "ST001"},
+        json={
+            "student_id": "ST001",
+            "completed_video_ids": ["VID-KS3-T02-ORI"],
+            "completed_worked_example_ids": ["WE-KS3-T02-01"],
+        },
     )
 
     assert orientation_completed.status_code == 200
@@ -985,6 +1108,7 @@ def test_diagnostic_and_orientation_lifecycle_uses_micro_skills(monkeypatch) -> 
     assert completed["current_phase"] == "GUIDED_PRACTICE"
     assert completed["question_id"] == "Q-T02-004"
     assert completed["student_model_state"]["target_micro_skill_ids"] == ["T02.M1"]
+    assert completed["message"] == "Now let’s use this idea together in a question."
     assert [event["event_type"] for event in events] == [
         "DIAGNOSTIC_QUESTION_SET_REQUESTED",
         "DIAGNOSTIC_COMPLETED",
@@ -1166,6 +1290,77 @@ def test_diagnostic_no_gaps_honors_direct_independent_transition(monkeypatch) ->
     body = completed.json()
     assert body["current_phase"] == "INDEPENDENT_PRACTICE"
     assert body["phase_transitions"][-1]["entry_reason"] == "DIAGNOSTIC_NO_GAPS"
+    assert body["message"] == (
+        "You already understand the main ideas in this topic. "
+        "Let’s try some more challenging questions on your own."
+    )
+
+
+def test_diagnostic_requires_every_mapping_for_one_skill_to_be_correct(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_post_json(
+        adapter_name: str,
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+        timeout_seconds: int,
+        retry_count: int,
+    ) -> dict[str, object]:
+        del adapter_name, url, headers, timeout_seconds, retry_count
+        captured.update(payload)
+        if payload["event_type"] == "DIAGNOSTIC_QUESTION_SET_REQUESTED":
+            response = _diagnostic_started_response()
+            phase_payload = response["phase_payload"]
+            assert isinstance(phase_payload, dict)
+            question_set = phase_payload["question_set"]
+            assert isinstance(question_set, dict)
+            questions = question_set["questions"]
+            assert isinstance(questions, list)
+            second = deepcopy(questions[0])
+            second["question_id"] = "Q-T02-D01-B"
+            second["question_usage_id"] = "QU-T02-D01-B-P0"
+            questions.append(second)
+            response["request_id"] = payload["request_id"]
+            return response
+        return _event_response(
+            str(payload["event_type"]),
+            str(payload["request_id"]),
+        )
+
+    settings = Settings(
+        student_model_url="https://student-model.example",
+        student_model_topic_codes={"ALG_LINEAR_ONE_STEP": "ALG-ORI-02"},
+        use_mock_student_model=False,
+    )
+    monkeypatch.setattr(provider, "get_settings", lambda: settings)
+    monkeypatch.setattr(session_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(student_model, "post_json", fake_post_json)
+
+    started = client.post(
+        "/session/start",
+        json={
+            "student_id": "ST001",
+            "concept_id": "ALG_LINEAR_ONE_STEP",
+            "interaction_mode": "TEXT",
+        },
+    ).json()
+    completed = client.post(
+        f"/session/{started['session_id']}/diagnostic/complete",
+        json={
+            "student_id": "ST001",
+            "answers": [
+                {"question_id": "Q-T02-D01", "student_response": "B"},
+                {"question_id": "Q-T02-D01-B", "student_response": "A"},
+            ],
+        },
+    )
+
+    assert completed.status_code == 200
+    assert captured["micro_skill_results"] == [
+        {"micro_skill_id": "T02.M1", "result": "INCORRECT"}
+    ]
+    assert completed.json()["current_phase"] == "CONCEPT_ORIENTATION"
 
 
 def test_diagnostic_rejects_incomplete_answers_without_transition(monkeypatch) -> None:

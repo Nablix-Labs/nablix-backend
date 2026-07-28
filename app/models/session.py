@@ -24,9 +24,11 @@ from app.models.fields import (
 )
 from app.models.session_review import SessionReviewResponse
 from app.models.student_model_session import (
+    PublicStudentModelEvent,
     StudentModelCoreState,
     StudentModelSessionEventResponse,
 )
+from app.services.phase1_tutor import Phase1TutorMessages
 
 
 class VoiceState(BaseModel):
@@ -80,6 +82,14 @@ class OrientationPhaseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     student_id: StudentId
+
+
+class OrientationCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    student_id: StudentId
+    completed_video_ids: list[NonEmptyText]
+    completed_worked_example_ids: list[NonEmptyText]
 
 
 class QuestionAttemptRecord(BaseModel):
@@ -150,6 +160,9 @@ class SessionRecord(BaseModel):
     canvas_state: CanvasState = Field(default_factory=CanvasState)
     ui_state: str
     message: str
+    diagnostic_transition_message: str | None = None
+    diagnostic_transition_messages: list[str] = Field(default_factory=list)
+    orientation_messages: Phase1TutorMessages | None = None
     show_canvas: bool = True
     show_hint_button: bool = False
     show_visual_cue: bool = False
@@ -184,3 +197,10 @@ class SessionRecord(BaseModel):
     student_model_state: StudentModelCoreState | None = None
     session_summary: SessionSummary | None = None
     session_review: SessionReviewResponse | None = None
+
+
+class SessionResponse(SessionRecord):
+    model_config = ConfigDict(from_attributes=True)
+
+    correct_answer: str | None = Field(default=None, exclude=True)
+    student_model_event: PublicStudentModelEvent | None = None

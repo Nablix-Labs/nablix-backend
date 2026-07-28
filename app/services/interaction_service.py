@@ -36,6 +36,7 @@ from app.models.session import (
     SessionSummary,
 )
 from app.models.student_model_session import (
+    AnswerSpec,
     GuidedAttemptEvent,
     GuidedPhaseCompletedEvent,
     GuidedQuestionSetRequestedEvent,
@@ -44,6 +45,7 @@ from app.models.student_model_session import (
     IndependentRetryCompletedEvent,
     Phase2RepairResult,
     StudentModelSessionEventResponse,
+    StudentModelQuestion,
     SupportUsed,
 )
 from app.services.phase_transition import (
@@ -175,7 +177,7 @@ def _updated_conversation_history(
     return updated_history[-max_messages:]
 
 
-def _schema_question_micro_skills(session: SessionRecord) -> list[str]:
+def _schema_question(session: SessionRecord) -> StudentModelQuestion:
     event = session.student_model_event
     if (
         event is None
@@ -187,7 +189,7 @@ def _schema_question_micro_skills(session: SessionRecord) -> list[str]:
             status_code=409,
             detail="The active Schema 3.0 question is missing its micro-skill mapping.",
         )
-    question = next(
+    question: StudentModelQuestion | None = next(
         (
             item
             for item in event.phase_payload.question_set.questions
@@ -200,6 +202,17 @@ def _schema_question_micro_skills(session: SessionRecord) -> list[str]:
             status_code=409,
             detail=f"Student Model did not return metadata for {session.question_id}.",
         )
+    return question
+
+
+def _active_answer_spec(session: SessionRecord) -> AnswerSpec | None:
+    if session.student_model_event is None:
+        return None
+    return _schema_question(session).tutor_view.answer_spec
+
+
+def _schema_question_micro_skills(session: SessionRecord) -> list[str]:
+    question = _schema_question(session)
     skills = [mapping.micro_skill_id for mapping in question.micro_skill_mappings]
     if not skills:
         raise HTTPException(
@@ -310,6 +323,69 @@ async def _initialize_restored_schema_phase(
             detail="Student Model did not initialize the restored phase with questions.",
         )
     return _apply_schema_event(session, response)
+def _schema_visual_cue(
+    event: StudentModelSessionEventResponse | None,
+) -> VisualCue | None:
+    if event is None or event.phase_payload is None:
+        return None
+    support = event.phase_payload.support_to_serve
+    if support is None:
+        return None
+    items = support.get("items")
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict) or item.get("content_type") != "VISUAL_CUE":
+            continue
+        content_id = item.get("content_id")
+        description = item.get("description")
+        if not isinstance(content_id, str) or not isinstance(description, str):
+            raise RuntimeError("Student Model returned a malformed visual cue.")
+        return VisualCue(show=True, cue_type=content_id, description=description)
+    return None
+
+
+def _schema_hint(event: StudentModelSessionEventResponse | None) -> str | None:
+    if event is None or event.phase_payload is None:
+        return None
+    support = event.phase_payload.support_to_serve
+    items = support.get("items") if support is not None else None
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if isinstance(item, dict) and item.get("content_type") == "HINT":
+            content = item.get("content")
+            return content if isinstance(content, str) else None
+    return None
+
+
+def _schema_support_steps(
+    event: StudentModelSessionEventResponse | None,
+) -> list[str]:
+    if event is None or event.phase_payload is None:
+        return []
+    support = event.phase_payload.support_to_serve
+    if support is not None:
+        steps = support.get("steps")
+        if isinstance(steps, list):
+            prompts: list[str] = []
+            for step in steps:
+                if isinstance(step, dict) and isinstance(step.get("prompt"), str):
+                    prompts.append(step["prompt"])
+            return prompts
+    rescue = event.phase_payload.rescue_to_serve
+    if rescue is None:
+        return []
+    result: list[str] = []
+    parallel = rescue.get("parallel_example")
+    if isinstance(parallel, dict):
+        worked_steps = parallel.get("worked_steps")
+        if isinstance(worked_steps, list):
+            result.extend(step for step in worked_steps if isinstance(step, str))
+    solved = rescue.get("tutor_solved")
+    if isinstance(solved, dict) and isinstance(solved.get("explanation"), str):
+        result.append(solved["explanation"])
+    return result
 
 
 def _recent_conversation_history(
@@ -716,6 +792,7 @@ async def _process_interaction(
         # Grade against the session's question: after a 6.7 transition swaps
         # the question, the request's id from the frontend may be stale.
         correct_answer=session.correct_answer,
+        answer_spec=_active_answer_spec(session),
         current_phase=session.current_phase,
         input_source=request.input_source,
         transcript_confidence=request.transcript_confidence,

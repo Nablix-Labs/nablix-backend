@@ -15,6 +15,7 @@ from app.models.interaction import InteractionResponse
 from app.models.session import (
     CanvasState,
     DiagnosticCompleteRequest,
+    OrientationCompletionRequest,
     OrientationPhaseRequest,
     PhaseTransitionRecord,
     QuestionAttemptRecord,
@@ -43,6 +44,8 @@ from app.services.phase_transition import (
     UI_STATE_FLAGS,
     resolve_transition,
 )
+from app.services.phase0_tutor import load_phase0_tutor_config
+from app.services.phase1_tutor import load_phase1_tutor_messages
 from app.services.student_model_session import (
     PHASE_FROM_STUDENT_MODEL,
     project_student_model_state,
@@ -59,6 +62,10 @@ _last_interaction_responses: dict[str, InteractionResponse] = {}
 
 def _build_session_id() -> str:
     return f"SESSION{uuid4().hex}"
+
+
+def _student_model_request_id(session_id: str, event_type: str) -> str:
+    return f"{session_id}:{event_type}:{uuid4().hex}"
 
 
 def _session_not_found(session_id: str) -> HTTPException:
@@ -148,9 +155,11 @@ async def get_next_question(
     return fetched
 
 
-def _diagnostic_start_message(question: str) -> str:
-    """Return the frontend intro message for the first diagnostic question."""
+def _diagnostic_start_message() -> str:
+    return load_phase0_tutor_config().intro_message
 
+
+def _legacy_start_message(question: str) -> str:
     spoken_question: str = question.replace("+", "plus").replace("=", "equals")
     return (
         "Let us start with a quick question to see where you are. "
@@ -210,7 +219,22 @@ def _recover_demo_session(
         ui_state=current_phase,
         hint_count=hint_count,
         status="started",
-        message=_diagnostic_start_message(question),
+        message=(
+            _diagnostic_start_message()
+            if current_phase == "DIAGNOSTIC"
+            else _legacy_start_message(question)
+        ),
+        diagnostic_transition_message=(
+            load_phase0_tutor_config().neutral_transition_message
+            if current_phase == "DIAGNOSTIC"
+            else None
+        ),
+        diagnostic_transition_messages=(
+            load_phase0_tutor_config().neutral_transition_messages
+            if current_phase == "DIAGNOSTIC"
+            else []
+        ),
+        show_canvas=UI_STATE_FLAGS[current_phase]["show_canvas"],
         show_hint_button=UI_STATE_FLAGS[current_phase]["show_hint_button"],
     )
     _sessions[session_id] = session
@@ -240,7 +264,22 @@ async def _start_legacy_session(
         ui_state=initial_phase,
         hint_count=0,
         status="started",
-        message=_diagnostic_start_message(question),
+        message=(
+            _diagnostic_start_message()
+            if initial_phase == "DIAGNOSTIC"
+            else _legacy_start_message(question)
+        ),
+        diagnostic_transition_message=(
+            load_phase0_tutor_config().neutral_transition_message
+            if initial_phase == "DIAGNOSTIC"
+            else None
+        ),
+        diagnostic_transition_messages=(
+            load_phase0_tutor_config().neutral_transition_messages
+            if initial_phase == "DIAGNOSTIC"
+            else []
+        ),
+        show_canvas=UI_STATE_FLAGS[initial_phase]["show_canvas"],
         show_hint_button=UI_STATE_FLAGS[initial_phase]["show_hint_button"],
     )
     _sessions[session.session_id] = session
@@ -277,7 +316,10 @@ async def start_session(
         )
         if settings.student_model_session_opened_enabled
         else DiagnosticQuestionSetRequestedEvent(
-            request_id=f"{session_id}:DIAGNOSTIC_QUESTION_SET_REQUESTED",
+            request_id=_student_model_request_id(
+                session_id,
+                "DIAGNOSTIC_QUESTION_SET_REQUESTED",
+            ),
             event_type="DIAGNOSTIC_QUESTION_SET_REQUESTED",
             topic_id=topic_id,
             student_id=request.student_id,
@@ -329,9 +371,15 @@ async def start_session(
         interaction_mode=request.interaction_mode,
         ui_state=phase,
         message=(
-            _diagnostic_start_message(current_question)
-            if phase == "DIAGNOSTIC" and isinstance(current_question, str)
+            _diagnostic_start_message()
+            if phase == "DIAGNOSTIC"
             else support_hint or event.routing.reason
+        ),
+        diagnostic_transition_message=(
+            load_phase0_tutor_config().neutral_transition_message
+        ),
+        diagnostic_transition_messages=(
+            load_phase0_tutor_config().neutral_transition_messages
         ),
         show_canvas=flags["show_canvas"],
         show_hint_button=flags["show_hint_button"],
@@ -454,10 +502,9 @@ def _schema_session(session_id: str, student_id: str) -> SessionRecord:
 
 
 def _schema_request_id(session: SessionRecord, event_type: str) -> str:
-    event = session.student_model_event
-    if event is None:
+    if session.student_model_event is None:
         raise RuntimeError("Schema 3.0 request id requires a stored Student Model event.")
-    return f"{session.session_id}:{event_type}:{event.journey_state.version + 1}"
+    return _student_model_request_id(session.session_id, event_type)
 
 
 def _schema_timestamp() -> str:
@@ -523,6 +570,7 @@ def _apply_schema_event(
         )
 
     flags = UI_STATE_FLAGS[next_phase]
+    phase1_messages = load_phase1_tutor_messages()
     question_updates = _question_updates(event)
     updates: dict[str, object] = {
         "current_phase": next_phase,
@@ -543,6 +591,10 @@ def _apply_schema_event(
         "allow_voice_input": flags["allow_voice_input"],
         **question_updates,
     }
+    if next_phase == "CONCEPT_ORIENTATION":
+        updates["orientation_messages"] = phase1_messages
+        if next_phase == session.current_phase:
+            updates["message"] = phase1_messages.before_video_message
     next_question_id = question_updates["question_id"]
     if next_question_id != session.question_id:
         updates.update(
@@ -573,14 +625,47 @@ def _apply_schema_event(
                 ],
             }
         )
-        transition_message = TRANSITION_MESSAGES.get(
-            (session.current_phase, next_phase)
+        phase0_config = load_phase0_tutor_config()
+        transition_message = (
+            _orientation_entry_message(event)
+            if (
+                session.current_phase == "DIAGNOSTIC"
+                and next_phase == "CONCEPT_ORIENTATION"
+            )
+            else (
+                phase0_config.no_gaps_transition_message
+                if (
+                    session.current_phase == "DIAGNOSTIC"
+                    and next_phase == "INDEPENDENT_PRACTICE"
+                )
+                else TRANSITION_MESSAGES.get((session.current_phase, next_phase))
+            )
         )
+        if (
+            session.current_phase == "CONCEPT_ORIENTATION"
+            and next_phase == "GUIDED_PRACTICE"
+        ):
+            transition_message = phase1_messages.worked_example_to_guided_message
         if transition_message is not None:
             updates["message"] = transition_message
     updated = session.model_copy(update=updates)
     _sessions[session.session_id] = updated
     return updated
+
+
+def _orientation_entry_message(event: StudentModelSessionEventResponse) -> str:
+    messages = load_phase1_tutor_messages()
+    payload = event.phase_payload
+    bundle = payload.orientation_bundle if payload is not None else None
+    if bundle is None:
+        return messages.transition_to_orientation_message
+    video_count = sum(
+        item.content_type == "ORIENTATION_VIDEO"
+        for item in bundle.delivery_sequence
+    )
+    if len(bundle.target_micro_skill_ids) > 1 and video_count == 1:
+        return messages.shared_video_transition_message
+    return messages.transition_to_orientation_message
 
 
 def _diagnostic_results(
@@ -703,6 +788,90 @@ def _orientation_targets(session: SessionRecord) -> list[str]:
     return targets
 
 
+def _required_orientation_content(session: SessionRecord) -> tuple[set[str], set[str]]:
+    event = session.student_model_event
+    payload = event.phase_payload if event is not None else None
+    bundle = payload.orientation_bundle if payload is not None else None
+    if bundle is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Student Model returned no active orientation bundle.",
+        )
+
+    video_ids: list[str] = []
+    worked_example_ids: list[str] = []
+    for item in bundle.delivery_sequence:
+        if item.content_type == "ORIENTATION_VIDEO":
+            if item.video is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Student Model orientation video item has no video content.",
+                )
+            video_ids.append(item.video.video_id)
+        elif item.content_type == "WORKED_EXAMPLE":
+            if item.worked_example is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Student Model worked-example item has no worked example content.",
+                )
+            worked_example_ids.append(item.worked_example.worked_example_id)
+
+    if len(video_ids) != len(set(video_ids)):
+        raise HTTPException(
+            status_code=503,
+            detail="Student Model orientation bundle contains duplicate video IDs.",
+        )
+    if len(worked_example_ids) != len(set(worked_example_ids)):
+        raise HTTPException(
+            status_code=503,
+            detail="Student Model orientation bundle contains duplicate worked-example IDs.",
+        )
+    return set(video_ids), set(worked_example_ids)
+
+
+def _validate_orientation_completion(
+    session: SessionRecord,
+    request: OrientationCompletionRequest,
+) -> None:
+    submitted_video_ids = set(request.completed_video_ids)
+    submitted_example_ids = set(request.completed_worked_example_ids)
+    if len(submitted_video_ids) != len(request.completed_video_ids):
+        raise HTTPException(
+            status_code=422,
+            detail="Completed orientation video IDs must be unique.",
+        )
+    if len(submitted_example_ids) != len(request.completed_worked_example_ids):
+        raise HTTPException(
+            status_code=422,
+            detail="Completed worked-example IDs must be unique.",
+        )
+
+    required_video_ids, required_example_ids = _required_orientation_content(session)
+    unknown_video_ids = submitted_video_ids - required_video_ids
+    unknown_example_ids = submitted_example_ids - required_example_ids
+    if unknown_video_ids or unknown_example_ids:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Orientation completion contains content that was not served: "
+                f"video_ids={sorted(unknown_video_ids)}, "
+                f"worked_example_ids={sorted(unknown_example_ids)}."
+            ),
+        )
+
+    missing_video_ids = required_video_ids - submitted_video_ids
+    missing_example_ids = required_example_ids - submitted_example_ids
+    if missing_video_ids or missing_example_ids:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Orientation content must be completed before entering Guided Practice: "
+                f"missing_video_ids={sorted(missing_video_ids)}, "
+                f"missing_worked_example_ids={sorted(missing_example_ids)}."
+            ),
+        )
+
+
 async def start_orientation(
     session_id: str,
     request: OrientationPhaseRequest,
@@ -742,7 +911,7 @@ async def start_orientation(
 
 async def complete_orientation(
     session_id: str,
-    request: OrientationPhaseRequest,
+    request: OrientationCompletionRequest,
     access_token: str,
 ) -> SessionRecord:
     session = _schema_session(session_id, request.student_id)
@@ -759,6 +928,7 @@ async def complete_orientation(
             status_code=409,
             detail="Orientation must be started before it can be completed.",
         )
+    _validate_orientation_completion(session, request)
     response = await get_adapters().student_model.send_session_event(
         OrientationCompletedEvent(
             request_id=_schema_request_id(session, "ORIENTATION_COMPLETED"),
