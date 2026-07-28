@@ -42,6 +42,7 @@ from app.models.student_model_session import (
     GuidedSupportEvent,
     IndependentQuestionSetRequestedEvent,
     IndependentRetryCompletedEvent,
+    Phase2RepairResult,
     StudentModelSessionEventResponse,
     SupportUsed,
 )
@@ -235,6 +236,11 @@ async def _initialize_restored_schema_phase(
         phase_state = event.journey_state.phase_2_guided_learning
         if phase_state.status != "NOT_STARTED":
             return session
+        if not phase_state.target_micro_skill_ids:
+            raise HTTPException(
+                status_code=503,
+                detail="Student Model returned no target skills for the restored phase.",
+            )
         request = GuidedQuestionSetRequestedEvent(
             request_id=(
                 f"{session.session_id}:GUIDED_QUESTION_SET_REQUESTED:"
@@ -250,6 +256,14 @@ async def _initialize_restored_schema_phase(
         phase_state = event.journey_state.phase_3_independent_practice
         if phase_state.status != "NOT_STARTED":
             return session
+        if not phase_state.target_micro_skill_ids:
+            raise HTTPException(
+                status_code=503,
+                detail="Student Model returned no target skills for the restored phase.",
+            )
+        support_by_skill = (
+            event.journey_state.phase_2_guided_learning.highest_support_used_by_skill
+        )
         request = IndependentQuestionSetRequestedEvent(
             request_id=(
                 f"{session.session_id}:INDEPENDENT_QUESTION_SET_REQUESTED:"
@@ -259,17 +273,18 @@ async def _initialize_restored_schema_phase(
             topic_id=event.journey_state.topic_id,
             student_id=session.student_id,
             timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            target_micro_skill_ids=phase_state.target_micro_skill_ids,
+            phase2_repair_results=[
+                Phase2RepairResult(
+                    micro_skill_id=micro_skill_id,
+                    highest_support_used=support_by_skill.get(micro_skill_id, "NONE"),
+                )
+                for micro_skill_id in phase_state.target_micro_skill_ids
+            ],
             used_question_ids=phase_state.used_question_ids,
         )
     else:
         return session
 
-    if not request.target_micro_skill_ids:
-        raise HTTPException(
-            status_code=503,
-            detail="Student Model returned no target skills for the restored phase.",
-        )
     response = await student_model.send_session_event(request, access_token)
     payload = response.phase_payload
     effective_phase = (

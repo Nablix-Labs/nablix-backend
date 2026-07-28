@@ -516,6 +516,7 @@ def _use_live_student_model(
     settings = Settings(
         student_model_url="https://student-model.example",
         student_model_topic_codes={"ALG_LINEAR_ONE_STEP": "ALG-ORI-02"},
+        student_model_session_opened_enabled=True,
         use_mock_student_model=False,
     )
     monkeypatch.setattr(provider, "get_settings", lambda: settings)
@@ -523,7 +524,7 @@ def _use_live_student_model(
     monkeypatch.setattr(student_model, "post_json", post_json)
 
 
-def test_session_start_uses_schema_3_session_opened_contract(monkeypatch) -> None:
+def test_session_start_uses_schema_3_diagnostic_contract_by_default(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     async def fake_post_json(
@@ -578,7 +579,7 @@ def test_session_start_uses_schema_3_session_opened_contract(monkeypatch) -> Non
     assert captured["headers"] == {"Authorization": "Bearer test-token"}
     payload = captured["payload"]
     assert isinstance(payload, dict)
-    assert payload["event_type"] == "SESSION_OPENED"
+    assert payload["event_type"] == "DIAGNOSTIC_QUESTION_SET_REQUESTED"
     assert payload["topic_id"] == "ALG-ORI-02"
     assert payload["student_id"] == "ST001"
     assert isinstance(payload["timestamp"], str)
@@ -701,6 +702,8 @@ def test_session_start_rejects_invalid_restore_without_local_state(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
+    event_types: list[object] = []
+
     async def fake_post_json(
         adapter_name: str,
         url: str,
@@ -710,6 +713,7 @@ def test_session_start_rejects_invalid_restore_without_local_state(
         retry_count: int,
     ) -> dict[str, object]:
         del adapter_name, url, headers, timeout_seconds, retry_count
+        event_types.append(payload["event_type"])
         response = _session_opened_response("PHASE_2_GUIDED_LEARNING")
         response["request_id"] = payload["request_id"]
         if failure == "IDENTITY_MISMATCH":
@@ -742,6 +746,7 @@ def test_session_start_rejects_invalid_restore_without_local_state(
     )
 
     assert response.status_code == 503
+    assert event_types == ["SESSION_OPENED"]
     assert set(session_service._sessions) == sessions_before
 
 
@@ -892,10 +897,14 @@ def test_restored_not_started_phase_initializes_before_answer(
         expected_initializer,
         "INCORRECT_ATTEMPT",
     ]
-    assert events[1]["target_micro_skill_ids"] == ["T02.M1"]
     assert events[2]["question_id"] == "Q-T02-INITIALIZED"
     if phase == "PHASE_3_INDEPENDENT_PRACTICE":
+        assert events[1]["phase2_repair_results"] == [
+            {"micro_skill_id": "T02.M1", "highest_support_used": "NONE"}
+        ]
         assert events[1]["used_question_ids"] == []
+    else:
+        assert events[1]["target_micro_skill_ids"] == ["T02.M1"]
 
 
 def test_diagnostic_and_orientation_lifecycle_uses_micro_skills(monkeypatch) -> None:
@@ -977,7 +986,7 @@ def test_diagnostic_and_orientation_lifecycle_uses_micro_skills(monkeypatch) -> 
     assert completed["question_id"] == "Q-T02-004"
     assert completed["student_model_state"]["target_micro_skill_ids"] == ["T02.M1"]
     assert [event["event_type"] for event in events] == [
-        "SESSION_OPENED",
+        "DIAGNOSTIC_QUESTION_SET_REQUESTED",
         "DIAGNOSTIC_COMPLETED",
         "WORKED_EXAMPLE_REQUESTED",
         "ORIENTATION_COMPLETED",

@@ -269,9 +269,14 @@ class GuidedQuestionSetRequestedEvent(SessionEventBase):
     target_micro_skill_ids: list[str]
 
 
+class Phase2RepairResult(BaseModel):
+    micro_skill_id: str
+    highest_support_used: SupportUsed
+
+
 class IndependentQuestionSetRequestedEvent(SessionEventBase):
     event_type: Literal["INDEPENDENT_QUESTION_SET_REQUESTED"]
-    target_micro_skill_ids: list[str]
+    phase2_repair_results: list[Phase2RepairResult]
     used_question_ids: list[str]
 
 
