@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
+from app.adapters.base import StudentModelAdapter
 from app.adapters.provider import get_adapters
 from app.adapters.tutor_engine import apply_retrieved_content
 from app.ai_engine.classifier_config import ClassifierRulesConfig, load_classifier_rules
@@ -39,6 +40,7 @@ from app.models.student_model_session import (
     GuidedPhaseCompletedEvent,
     GuidedQuestionSetRequestedEvent,
     GuidedSupportEvent,
+    IndependentQuestionSetRequestedEvent,
     IndependentRetryCompletedEvent,
     StudentModelSessionEventResponse,
     SupportUsed,
@@ -58,6 +60,12 @@ from app.services.session_service import (
     interaction_lock_for,
     last_interaction_response_for,
     update_interaction_state,
+)
+from app.services.student_model_session import (
+    PHASE_FROM_STUDENT_MODEL,
+    schema_hint,
+    schema_support_steps,
+    schema_visual_cue,
 )
 
 
@@ -214,69 +222,79 @@ def _schema_support_used(
     return max(supports, key=_SUPPORT_RANK.index)
 
 
-def _schema_visual_cue(
-    event: StudentModelSessionEventResponse | None,
-) -> VisualCue | None:
-    if event is None or event.phase_payload is None:
-        return None
-    support = event.phase_payload.support_to_serve
-    if support is None:
-        return None
-    items = support.get("items")
-    if not isinstance(items, list):
-        return None
-    for item in items:
-        if not isinstance(item, dict) or item.get("content_type") != "VISUAL_CUE":
-            continue
-        content_id = item.get("content_id")
-        description = item.get("description")
-        if not isinstance(content_id, str) or not isinstance(description, str):
-            raise RuntimeError("Student Model returned a malformed visual cue.")
-        return VisualCue(show=True, cue_type=content_id, description=description)
-    return None
+async def _initialize_restored_schema_phase(
+    session: SessionRecord,
+    student_model: StudentModelAdapter,
+    access_token: str,
+) -> SessionRecord:
+    event = session.student_model_event
+    if event is None:
+        return session
 
+    if session.current_phase == "GUIDED_PRACTICE":
+        phase_state = event.journey_state.phase_2_guided_learning
+        if phase_state.status != "NOT_STARTED":
+            return session
+        request = GuidedQuestionSetRequestedEvent(
+            request_id=(
+                f"{session.session_id}:GUIDED_QUESTION_SET_REQUESTED:"
+                f"{event.journey_state.version + 1}"
+            ),
+            event_type="GUIDED_QUESTION_SET_REQUESTED",
+            topic_id=event.journey_state.topic_id,
+            student_id=session.student_id,
+            timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            target_micro_skill_ids=phase_state.target_micro_skill_ids,
+        )
+    elif session.current_phase == "INDEPENDENT_PRACTICE":
+        phase_state = event.journey_state.phase_3_independent_practice
+        if phase_state.status != "NOT_STARTED":
+            return session
+        request = IndependentQuestionSetRequestedEvent(
+            request_id=(
+                f"{session.session_id}:INDEPENDENT_QUESTION_SET_REQUESTED:"
+                f"{event.journey_state.version + 1}"
+            ),
+            event_type="INDEPENDENT_QUESTION_SET_REQUESTED",
+            topic_id=event.journey_state.topic_id,
+            student_id=session.student_id,
+            timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            target_micro_skill_ids=phase_state.target_micro_skill_ids,
+            used_question_ids=phase_state.used_question_ids,
+        )
+    else:
+        return session
 
-def _schema_hint(event: StudentModelSessionEventResponse | None) -> str | None:
-    if event is None or event.phase_payload is None:
-        return None
-    support = event.phase_payload.support_to_serve
-    items = support.get("items") if support is not None else None
-    if not isinstance(items, list):
-        return None
-    for item in items:
-        if isinstance(item, dict) and item.get("content_type") == "HINT":
-            content = item.get("content")
-            return content if isinstance(content, str) else None
-    return None
-
-
-def _schema_support_steps(
-    event: StudentModelSessionEventResponse | None,
-) -> list[str]:
-    if event is None or event.phase_payload is None:
-        return []
-    support = event.phase_payload.support_to_serve
-    if support is not None:
-        steps = support.get("steps")
-        if isinstance(steps, list):
-            prompts: list[str] = []
-            for step in steps:
-                if isinstance(step, dict) and isinstance(step.get("prompt"), str):
-                    prompts.append(step["prompt"])
-            return prompts
-    rescue = event.phase_payload.rescue_to_serve
-    if rescue is None:
-        return []
-    result: list[str] = []
-    parallel = rescue.get("parallel_example")
-    if isinstance(parallel, dict):
-        worked_steps = parallel.get("worked_steps")
-        if isinstance(worked_steps, list):
-            result.extend(step for step in worked_steps if isinstance(step, str))
-    solved = rescue.get("tutor_solved")
-    if isinstance(solved, dict) and isinstance(solved.get("explanation"), str):
-        result.append(solved["explanation"])
-    return result
+    if not request.target_micro_skill_ids:
+        raise HTTPException(
+            status_code=503,
+            detail="Student Model returned no target skills for the restored phase.",
+        )
+    response = await student_model.send_session_event(request, access_token)
+    payload = response.phase_payload
+    effective_phase = (
+        response.journey_state.recommended_entry_phase
+        or response.journey_state.current_phase
+    )
+    initialized_state = (
+        response.journey_state.phase_2_guided_learning
+        if session.current_phase == "GUIDED_PRACTICE"
+        else response.journey_state.phase_3_independent_practice
+    )
+    if (
+        payload is None
+        or PHASE_FROM_STUDENT_MODEL[payload.phase] != session.current_phase
+        or payload.phase != effective_phase
+        or payload.payload_type != "QUESTION_SET"
+        or payload.question_set is None
+        or not payload.question_set.questions
+        or initialized_state.status == "NOT_STARTED"
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Student Model did not initialize the restored phase with questions.",
+        )
+    return _apply_schema_event(session, response)
 
 
 def _recent_conversation_history(
@@ -749,6 +767,25 @@ async def _process_interaction(
             ),
         )
 
+    if (
+        session.student_model_event is not None
+        and session.current_phase in {"GUIDED_PRACTICE", "INDEPENDENT_PRACTICE"}
+        and request.interaction_type == "ANSWER_SUBMISSION"
+    ):
+        session = await _initialize_restored_schema_phase(
+            session,
+            adapters.student_model,
+            access_token,
+        )
+        turn_session = session
+        context = context.model_copy(
+            update={
+                "question": session.current_question,
+                "correct_answer": session.correct_answer,
+                "question_number": session.question_number,
+            }
+        )
+
     _, student, tutor = await run_tutor_pipeline(context)
     tutor = tutor.model_copy(update={"safety_check": safety_check})
     schema_response: StudentModelSessionEventResponse | None = None
@@ -921,14 +958,14 @@ async def _process_interaction(
             continue
         student = await adapters.student_model.update_from_event(event, context, access_token)
 
-    visual_cue = _schema_visual_cue(schema_content_response) or (
+    visual_cue = schema_visual_cue(schema_content_response) or (
         tutor.visual_cue if tutor.visual_cue.show else None
     )
-    schema_hint = _schema_hint(schema_content_response)
-    schema_steps = _schema_support_steps(schema_content_response)
+    schema_hint_text = schema_hint(schema_content_response)
+    schema_steps = schema_support_steps(schema_content_response)
     scaffold_steps = schema_steps or tutor.scaffold_steps_delivered
-    tutor_message = schema_hint or tutor.tutor_message
-    tutor_message_voice = schema_hint or tutor.tutor_message_voice
+    tutor_message = schema_hint_text or tutor.tutor_message
+    tutor_message_voice = schema_hint_text or tutor.tutor_message_voice
     conversation_history: list[ConversationMessage] = _updated_conversation_history(
         turn_session.conversation_history,
         student_message,

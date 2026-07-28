@@ -45,6 +45,9 @@ from app.services.phase_transition import (
 from app.services.student_model_session import (
     PHASE_FROM_STUDENT_MODEL,
     project_student_model_state,
+    schema_hint,
+    schema_support_steps,
+    schema_visual_cue,
 )
 
 
@@ -278,6 +281,9 @@ async def start_session(
     question_updates = _question_updates(event)
     current_question = question_updates["current_question"]
     recommended_phase = event.journey_state.recommended_entry_phase
+    visual_cue = schema_visual_cue(event)
+    support_steps = schema_support_steps(event)
+    support_hint = schema_hint(event)
     session = SessionRecord(
         session_id=session_id,
         student_id=request.student_id,
@@ -294,12 +300,13 @@ async def start_session(
         message=(
             _diagnostic_start_message(current_question)
             if phase == "DIAGNOSTIC" and isinstance(current_question, str)
-            else event.routing.reason
+            else support_hint or event.routing.reason
         ),
         show_canvas=flags["show_canvas"],
         show_hint_button=flags["show_hint_button"],
-        show_visual_cue=flags["show_visual_cue"],
-        show_scaffold_panel=flags["show_scaffold_panel"],
+        show_visual_cue=flags["show_visual_cue"] or visual_cue is not None,
+        show_scaffold_panel=flags["show_scaffold_panel"] or bool(support_steps),
+        scaffold_steps=support_steps,
         allow_text_input=flags["allow_text_input"],
         allow_voice_input=flags["allow_voice_input"],
         hint_count=0,
@@ -326,30 +333,56 @@ def _validate_session_opened_payload(
             detail="Student Model returned no phase payload for SESSION_OPENED.",
         )
 
-    expected_types: dict[StudentModelPhase, str] = {
-        "PHASE_0_DIAGNOSTIC": "QUESTION_SET",
-        "PHASE_1_ORIENTATION": "ORIENTATION_BUNDLE",
-        "PHASE_2_GUIDED_LEARNING": "QUESTION_SET",
-        "PHASE_3_INDEPENDENT_PRACTICE": "QUESTION_SET",
-        "REVIEW": "REVIEW_SUMMARY",
+    expected_phase = (
+        event.journey_state.recommended_entry_phase
+        or event.journey_state.current_phase
+    )
+    if payload.phase != expected_phase:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Student Model returned phase payload {payload.phase}; "
+                f"expected effective phase {expected_phase}."
+            ),
+        )
+
+    expected_types: dict[StudentModelPhase, set[str]] = {
+        "PHASE_0_DIAGNOSTIC": {"QUESTION_SET"},
+        "PHASE_1_ORIENTATION": {"ORIENTATION_BUNDLE"},
+        "PHASE_2_GUIDED_LEARNING": {
+            "QUESTION_SET",
+            "SUPPORT_AND_RETRY",
+            "SCAFFOLD",
+            "RESCUE",
+        },
+        "PHASE_3_INDEPENDENT_PRACTICE": {
+            "QUESTION_SET",
+            "RESCUE_AND_FRESH_QUESTION",
+        },
+        "REVIEW": {"REVIEW_SUMMARY"},
     }
-    expected_type = expected_types[payload.phase]
-    if payload.payload_type != expected_type:
+    allowed_types = expected_types[payload.phase]
+    if payload.payload_type not in allowed_types:
         raise HTTPException(
             status_code=503,
             detail=(
                 f"Student Model returned payload type {payload.payload_type} "
-                f"for {payload.phase}; expected {expected_type}."
+                f"for {payload.phase}; expected one of {sorted(allowed_types)}."
             ),
         )
-    if expected_type == "QUESTION_SET" and (
+    if payload.payload_type in {
+        "QUESTION_SET",
+        "SUPPORT_AND_RETRY",
+        "SCAFFOLD",
+        "RESCUE_AND_FRESH_QUESTION",
+    } and (
         payload.question_set is None or not payload.question_set.questions
     ):
         raise HTTPException(
             status_code=503,
             detail=f"Student Model returned no questions for {payload.phase}.",
         )
-    if expected_type == "ORIENTATION_BUNDLE" and (
+    if payload.payload_type == "ORIENTATION_BUNDLE" and (
         payload.orientation_bundle is None
         or not payload.orientation_bundle.delivery_sequence
     ):
@@ -357,7 +390,21 @@ def _validate_session_opened_payload(
             status_code=503,
             detail="Student Model returned no orientation content.",
         )
-    if expected_type == "REVIEW_SUMMARY" and payload.review_summary is None:
+    if payload.payload_type in {"SUPPORT_AND_RETRY", "SCAFFOLD"} and (
+        payload.support_to_serve is None
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Student Model returned no guided support content.",
+        )
+    if payload.payload_type in {"RESCUE", "RESCUE_AND_FRESH_QUESTION"} and (
+        payload.rescue_to_serve is None
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Student Model returned no rescue content.",
+        )
+    if payload.payload_type == "REVIEW_SUMMARY" and payload.review_summary is None:
         raise HTTPException(
             status_code=503,
             detail="Student Model returned no review summary.",

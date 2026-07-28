@@ -269,6 +269,12 @@ class GuidedQuestionSetRequestedEvent(SessionEventBase):
     target_micro_skill_ids: list[str]
 
 
+class IndependentQuestionSetRequestedEvent(SessionEventBase):
+    event_type: Literal["INDEPENDENT_QUESTION_SET_REQUESTED"]
+    target_micro_skill_ids: list[str]
+    used_question_ids: list[str]
+
+
 StudentModelSessionEvent: TypeAlias = (
     SessionOpenedEvent
     | DiagnosticQuestionSetRequestedEvent
@@ -280,6 +286,7 @@ StudentModelSessionEvent: TypeAlias = (
     | GuidedPhaseCompletedEvent
     | IndependentRetryCompletedEvent
     | GuidedQuestionSetRequestedEvent
+    | IndependentQuestionSetRequestedEvent
 )
 
 
