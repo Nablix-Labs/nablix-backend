@@ -124,14 +124,20 @@ def validate_session_history(request: SessionReviewRequest) -> None:
 
 
 def resolve_protected_answers(history: list[QuestionAttempt]) -> list[str]:
+    """Answers the review text must never reveal — for the questions we know.
+
+    correct_answer_for() only knows bank-served and demo questions. Questions
+    served by the Student Model's Schema 3.0 question_set (the diagnostic's
+    Q-T01-D01 etc.) are in neither registry, and raising here meant EVERY
+    session that touched the diagnostic — every real student's — got a 502
+    from /session/end (found live, 31 Jul). An unknown answer is nothing to
+    protect, not a reason to refuse the whole review.
+    """
     answers: list[str] = []
     for question_id in dict.fromkeys(attempt.question_id for attempt in history):
         answer: str | None = correct_answer_for(question_id)
-        if answer is None:
-            raise QuestionAnswerNotFoundError(
-                f"No correct answer is registered for question_id={question_id}"
-            )
-        answers.append(answer)
+        if answer is not None:
+            answers.append(answer)
     return answers
 
 
@@ -416,6 +422,7 @@ def build_openai_session_review_client(settings: Settings) -> OpenAIAIEngineClie
         model=settings.openai_ai_engine_model,
         timeout_seconds=settings.openai_request_timeout_seconds,
         prompt_cache_key_enabled=settings.openai_prompt_cache_key_enabled,
+        store_responses=settings.openai_store_responses,
         retry_count=settings.adapter_request_retry_count,
     )
 
