@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
 import yaml
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from app.ai_engine.schemas import ErrorType, IntentType, LearningPhase, ResponseStrategy, StrictSchema, VisualCueType
+from app.models.guided_learning import GuidedStudentState
+from app.models.student_model_session import QuestionType
 
 
 CONFIG_PATH: Path = Path("configs/classifier_rules.yaml")
@@ -67,8 +70,13 @@ class StrategyRulesConfig(StrictSchema):
     review_phase: LearningPhase
     guided_practice_phase: LearningPhase
     independent_practice_phase: LearningPhase
+    stuck_scaffold_min_count: int = Field(ge=1)
     scaffold_min_attempt_count: int = Field(ge=1)
     worked_example_min_attempt_count: int = Field(ge=1)
+
+
+class ScaffoldResponseRulesConfig(StrictSchema):
+    aliases: dict[str, list[str]]
 
 
 class VisualCueRuleConfig(StrictSchema):
@@ -86,6 +94,7 @@ class AnswerRevealGuardrailConfig(StrictSchema):
     direct_request_phrases: list[str]
     override_phrases: list[str]
     reveal_phrases: list[str]
+    rewrite_feedback: str
     safe_message: str
     flag_type: str
     action_taken: str
@@ -94,6 +103,18 @@ class AnswerRevealGuardrailConfig(StrictSchema):
 class ConversationRulesConfig(StrictSchema):
     max_recent_messages: int = Field(ge=0)
     acknowledgement_phrases: list[str]
+
+
+class ReasoningCompletionConfig(StrictSchema):
+    required_phases: list[LearningPhase]
+    explanation_terms: list[str]
+    operation_terms: list[str]
+    minimum_explanation_words: int = Field(ge=2)
+    minimum_canvas_steps: int = Field(ge=2)
+    explanation_required_message: str
+    explanation_incomplete_message: str
+    explanation_reason_message: str
+    explanation_accepted_message: str
 
 
 class CanvasReviewMessagesConfig(StrictSchema):
@@ -134,6 +155,49 @@ class MessageConfig(StrictSchema):
     QUESTION_COMPLETE_ACKNOWLEDGEMENT: str
     CONTEXTUAL_ACKNOWLEDGEMENT: str
     QUESTION_ALREADY_COMPLETE: str
+    NEXT_QUESTION: str
+    SCAFFOLD_STEP_RETRY: str
+    SCAFFOLD_ORIGINAL_RETRY: str
+
+
+class GuidedStateMappingConfig(StrictSchema):
+    student_model_event: str | None
+    strategy: str | None
+
+
+class GuidedLearningConfig(StrictSchema):
+    evaluation_mode: str
+    confidence_threshold: float = Field(ge=0.0, le=1.0)
+    state_confidence_thresholds: dict[
+        GuidedStudentState,
+        Annotated[float, Field(ge=0.0, le=1.0)],
+    ]
+    maximum_retries: int = Field(ge=0)
+    stuck_escalation_count: int = Field(ge=1)
+    maximum_recent_history_turns: int = Field(ge=0)
+    rubric_prompt_version: str
+    evaluator_prompt_version: str
+    rubric_system_prompt: str
+    evaluator_system_prompt: str
+    scaffold_evaluator_system_prompt: str
+    answer_reveal_retry_feedback: str
+    reconciliation_message: str
+    allowed_student_states: list[GuidedStudentState]
+    supported_verification_methods: list[str]
+    multi_component_question_types: list[QuestionType]
+    llm_state_mapping: dict[GuidedStudentState, GuidedStateMappingConfig]
+
+    @model_validator(mode="after")
+    def require_state_confidence_thresholds(self) -> "GuidedLearningConfig":
+        missing_states = set(self.allowed_student_states) - set(
+            self.state_confidence_thresholds
+        )
+        if missing_states:
+            raise ValueError(
+                "Missing Guided Learning confidence thresholds for "
+                f"{sorted(missing_states)}."
+            )
+        return self
 
 
 class ClassifierRulesConfig(StrictSchema):
@@ -145,12 +209,15 @@ class ClassifierRulesConfig(StrictSchema):
     error_patterns: ErrorPatternsConfig
     diagnostic_cases: DiagnosticCasesConfig
     strategy_rules: StrategyRulesConfig
+    scaffold_response_rules: ScaffoldResponseRulesConfig
     visual_cue_rules: VisualCueRulesConfig
     answer_reveal_guardrail: AnswerRevealGuardrailConfig
     conversation_rules: ConversationRulesConfig
+    reasoning_completion: ReasoningCompletionConfig
     canvas_review: CanvasReviewConfig
     progressive_hint_messages: dict[ErrorType, list[str]]
     messages: MessageConfig
+    guided_learning: GuidedLearningConfig
 
 
 @lru_cache(maxsize=1)

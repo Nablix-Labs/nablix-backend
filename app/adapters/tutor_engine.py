@@ -92,14 +92,19 @@ class TutorEngineServiceAdapter:
         if context.question is not None and context.correct_answer is not None:
             ai_response = classify_student_response(
                 ClassificationRequest(
+                    question_id=context.question_id,
+                    question_type=context.question_type,
                     question=context.question,
                     correct_answer=context.correct_answer,
+                    answer_spec=context.answer_spec,
+                    phase_2_prompt_context=context.phase_2_prompt_context,
                     student_input=context.message,
                     current_phase=_coerce_learning_phase(context.current_phase),
                     input_source=_coerce_input_source(context.input_source),
                     transcript_confidence=context.transcript_confidence,
                     attempt_count=context.attempt_count if context.attempt_count is not None else 1,
                     question_completed=context.question_completed,
+                    answer_value_confirmed=context.answer_value_confirmed,
                     question_number=context.question_number or 1,
                     current_hint_level=_coerce_hint_level(context.current_hint_level),
                     concept_id=context.concept_id,
@@ -109,6 +114,9 @@ class TutorEngineServiceAdapter:
                     canvas_regions=_coerce_canvas_regions(context.canvas_regions),
                     conversation_history=context.conversation_history,
                     conversation_state=context.conversation_state,
+                    generated_question_rubric=context.generated_question_rubric,
+                    active_teaching_objective=context.active_teaching_objective,
+                    scaffold_evaluation_context=context.scaffold_evaluation_context,
                 )
             )
             return _tutor_result_from_ai_response(ai_response)
@@ -138,6 +146,9 @@ class TutorEngineServiceAdapter:
                     independent_success=False,
                 )
             ],
+            attempt_increment=1,
+            recommended_conversation_action="GIVE_HINT",
+            question_completed=False,
         )
 
     def _mock_response(self, request: TutorEngineRequest) -> TutorResult:
@@ -168,6 +179,7 @@ def _tutor_result_from_ai_response(response: TutorResponse) -> TutorResult:
             show=response.visual_cue.show,
             cue_type=response.visual_cue.cue_type,
             description=response.visual_cue.description,
+            actions=response.visual_cue.actions,
         ),
         canvas_feedback=CanvasFeedback(
             has_feedback=response.canvas_feedback.has_feedback,
@@ -243,6 +255,13 @@ def _tutor_result_from_ai_response(response: TutorResponse) -> TutorResult:
             response.recommended_conversation_action
         ),
         question_completed=response.question_completed,
+        answer_value_confirmed=response.answer_value_confirmed,
+        reasoning_complete=response.reasoning_complete,
+        guided_student_state=response.guided_student_state,
+        selected_error_code=response.selected_error_code,
+        generated_question_rubric=response.generated_question_rubric,
+        active_teaching_objective=response.active_teaching_objective,
+        scaffold_original_answer_correct=response.scaffold_original_answer_correct,
     )
 
 
@@ -277,11 +296,5 @@ def apply_retrieved_content(
         correct_answer,
         rules,
     ):
-        safe_message: str = rules.answer_reveal_guardrail.safe_message
-        return updated_result.model_copy(
-            update={
-                "tutor_message": safe_message,
-                "tutor_message_voice": safe_message,
-            }
-        )
+        return result
     return updated_result

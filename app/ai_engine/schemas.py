@@ -4,6 +4,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
+from app.models.adapters import ConversationAction
+from app.models.guided_learning import (
+    ActiveTeachingObjective,
+    GeneratedQuestionRubric,
+    GuidedStudentState,
+)
+
 
 EvaluationCategory = Literal[
     "CORRECT",
@@ -60,6 +67,7 @@ LearningPhase = Literal[
     "REVIEW",
 ]
 
+
 LearningEventType = Literal[
     "CORRECT_ATTEMPT",
     "INCORRECT_ATTEMPT",
@@ -102,6 +110,7 @@ class VisualCue(StrictSchema):
     show: StrictBool
     cue_type: VisualCueType | None
     description: str | None
+    actions: list[dict[str, object]] = Field(default_factory=list)
 
 
 class HighlightInstruction(StrictSchema):
@@ -199,13 +208,13 @@ class TutorResponse(StrictSchema):
     safety_check: SafetyCheck
     guardrail_check: GuardrailCheck
     student_model_events: list[StudentModelEvent]
-    attempt_increment: int = Field(default=0, ge=0, le=1)
-    recommended_conversation_action: Literal[
-        "ASK_QUESTION",
-        "GIVE_HINT",
-        "ACKNOWLEDGE_ANSWER",
-        "REQUEST_CLARIFICATION",
-        "ADVANCE_TO_NEXT_QUESTION",
-        "WAIT_FOR_STUDENT",
-    ] = "WAIT_FOR_STUDENT"
-    question_completed: StrictBool = False
+    attempt_increment: int = Field(ge=0, le=1)
+    recommended_conversation_action: ConversationAction
+    question_completed: StrictBool
+    answer_value_confirmed: StrictBool = False
+    reasoning_complete: StrictBool = False
+    guided_student_state: GuidedStudentState | None = None
+    selected_error_code: str | None = None
+    generated_question_rubric: GeneratedQuestionRubric | None = None
+    active_teaching_objective: ActiveTeachingObjective | None = None
+    scaffold_original_answer_correct: StrictBool = False
