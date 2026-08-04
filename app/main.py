@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api import ai_engine, canvas, health, hint, interaction, session, voice
+from app.api import ai_engine, canvas, health, interaction, session, voice
 from app.ai_engine.prompt_registry import load_prompt_registry
 from app.core.config import get_settings
 from app.core.logger import logger
@@ -44,7 +44,6 @@ app.include_router(health.router, tags=["Health"])
 app.include_router(ai_engine.router, prefix="/ai-engine", tags=["AI Engine"])
 app.include_router(session.router, prefix="/session", tags=["Session"])
 app.include_router(interaction.router, tags=["Interaction"])
-app.include_router(hint.router, prefix="/hint", tags=["Hints"])
 app.include_router(canvas.router, prefix="/canvas", tags=["Canvas"])
 app.include_router(voice.router, prefix="/voice", tags=["Voice"])
 
@@ -104,14 +103,18 @@ def _validation_response_message(
     if error_code == "INVALID_FORMAT" and field == "student_id":
         return "student_id must follow the format ST followed by three digits."
     if error_code == "INVALID_FORMAT" and field == "session_id":
-        return "session_id must follow the format SESSION followed by three digits."
+        return (
+            "session_id must follow the format SESSION followed by three digits "
+            "or a UUID hex string."
+        )
     if error_code == "INPUT_TOO_LONG":
         field_name: str = field if field is not None else "input"
         return f"{field_name} must be 500 characters or fewer."
     if field == "interaction_type":
         return (
-            "interaction_type must be one of ANSWER_SUBMISSION, HINT_REQUEST, "
-            "CANVAS_SUBMISSION, SESSION_START, SESSION_END."
+            "interaction_type must be one of ANSWER_SUBMISSION, CANVAS_SUBMISSION, "
+            "EXPLAIN_AGAIN, INACTIVITY_NUDGE, NUDGE_PRESENTED, HELP_REQUEST, "
+            "SUPPORT_REPLAY, CLARIFICATION, SESSION_START, SESSION_END."
         )
     if field == "current_phase":
         return (
@@ -159,7 +162,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
-    # Typed exceptions (e.g. QuestionFetchError) carry their own error_code.
+    # Typed application exceptions carry their own error_code.
     return _error_response(
         request, exc.status_code, getattr(exc, "error_code", "HTTP_ERROR"), str(exc.detail)
     )
