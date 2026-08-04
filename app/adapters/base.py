@@ -22,12 +22,15 @@ from app.models.adapters import (
     AdapterContext,
     RAGResult,
     SafetyCheckResult,
-    StudentModelEvent,
     StudentModelResult,
     TutorEngineRequest,
     TutorResult,
     VisionOCRResult,
     VoiceResult,
+)
+from app.models.student_model_session import (
+    StudentModelSessionEvent,
+    StudentModelSessionEventResponse,
 )
 
 
@@ -59,12 +62,11 @@ class StudentModelAdapter(Protocol):
     def parse_response(self, response: dict[str, object]) -> StudentModelResult: ...
     def handle_error(self, error: AdapterError) -> NoReturn: ...
     async def assess(self, context: AdapterContext) -> StudentModelResult: ...
-    async def update_from_event(
+    async def send_session_event(
         self,
-        event: StudentModelEvent,
-        context: AdapterContext,
+        event: StudentModelSessionEvent,
         access_token: str,
-    ) -> StudentModelResult: ...
+    ) -> StudentModelSessionEventResponse: ...
 
 
 class TutorEngineAdapter(Protocol):
