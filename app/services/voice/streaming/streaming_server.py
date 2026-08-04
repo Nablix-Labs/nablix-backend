@@ -47,6 +47,52 @@ DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen"
 DEEPGRAM_API_KEY = voice_config.DEEPGRAM_API_KEY
 MAIN_BACKEND_URL = os.getenv("NABLIX_MAIN_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 
+# Math-domain keyterms for Deepgram Nova-3 keyterm prompting.
+# These help the STT model recognize math vocabulary that it
+# often mis-transcribes (e.g. "coefficient" -> "co efficient",
+# "x equals" -> "eggs equals"). Up to 100 terms / 500 tokens.
+# Docs: https://developers.deepgram.com/docs/keyterm
+MATH_KEYTERMS = [
+    # Algebra basics
+    "equation", "variable", "coefficient", "constant",
+    "expression", "simplify", "substitute",
+    # Operations
+    "addition", "subtraction", "multiplication", "division",
+    "subtract", "multiply", "divide",
+    # Fractions and numbers
+    "numerator", "denominator", "fraction", "decimal",
+    "negative", "positive", "integer",
+    # Equation solving
+    "solve for x", "both sides", "isolate",
+    "x equals", "inverse operation", "x equal to", "x is equal to", "x is",
+    # Types
+    "linear", "quadratic", "one step", "two step",
+    # Common math phrases students say
+    "plus", "minus", "times", "divided by", "equals",
+    "squared", "cubed", "square root",
+    "greater than", "less than",
+]
+
+
+def _build_deepgram_params(language: str = "en") -> str:
+    """Build the Deepgram WebSocket query string with keyterm prompting."""
+    params = (
+        f"?model=nova-3"
+        f"&language={language}"
+        f"&smart_format=true"
+        f"&punctuate=true"
+        f"&interim_results=true"
+        f"&utterance_end_ms=1500"
+        f"&encoding=linear16"
+        f"&sample_rate=16000"
+        f"&channels=1"
+    )
+    # Add each math keyterm. Multi-word phrases use + encoding.
+    for term in MATH_KEYTERMS:
+        encoded = term.replace(" ", "+")
+        params += f"&keyterm={encoded}"
+    return params
+
 # Reuse one backend client, but create it lazily so importing app.main does not
 # initialize the voice streaming HTTP stack.
 _backend_http_client: httpx.AsyncClient | None = None
@@ -85,7 +131,15 @@ async def evaluate_voice_transcript(
     confidence: float,
     audio_duration_seconds: float,
     access_token: str,
+    turn_id: str | None,
+    previous_tutor_turn_id: str | None,
+    transcript_final: bool | None,
+    canvas_snapshot_id: str | None,
 ) -> dict[str, object]:
+    if turn_id is None:
+        raise ValueError("turn_id is required for voice interactions")
+    if transcript_final is not True:
+        raise ValueError("transcript_final must be true for voice interactions")
     payload = {
         "session_id": session_id,
         "student_id": student_id,
@@ -94,12 +148,21 @@ async def evaluate_voice_transcript(
         "audio_duration_seconds": audio_duration_seconds,
         "turn": "STUDENT",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "turn_id": turn_id,
+        "previous_tutor_turn_id": previous_tutor_turn_id,
+        "transcript_final": transcript_final,
+        "canvas_snapshot_id": canvas_snapshot_id,
     }
     logger.info(f"[{session_id}] POST /voice/transcript")
     response = await get_backend_http_client().post(
         "/voice/transcript",
         json=payload,
         headers={"Authorization": f"Bearer {access_token}"},
+        # Same budget as /canvas/submit below. This call previously inherited
+        # the client default of 15s while canvas got 40s for comparable LLM
+        # work; slowest observed voice turn was 12.5s (30 Jul, n=121), which
+        # left 17% headroom before a timeout indistinguishable from an outage.
+        timeout=40.0,
     )
     if response.status_code != 200:
         raise RuntimeError(f"status={response.status_code} body={response.text}")
@@ -120,6 +183,7 @@ async def submit_canvas_work(
         "snapshot_data_url": snapshot_data_url,
         "transcript": transcript or None,
         "transcript_confidence": confidence,
+        "submission_role": "VOICE_ATTACHMENT",
     }
     logger.info(f"[{session_id}] POST {MAIN_BACKEND_URL}/canvas/submit")
     response = await get_backend_http_client().post(
@@ -131,41 +195,6 @@ async def submit_canvas_work(
     if response.status_code != 200:
         raise RuntimeError(f"status={response.status_code} body={response.text}")
     return response.json()
-
-
-def _tutor_response_from_canvas(result: dict[str, object]) -> dict[str, object]:
-    tutor = result.get("tutor")
-    if not isinstance(tutor, dict):
-        raise RuntimeError("canvas response missing tutor object")
-
-    tutor_message = tutor.get("tutor_message")
-    if not isinstance(tutor_message, str) or tutor_message == "":
-        raise RuntimeError("canvas tutor response missing tutor_message")
-
-    tutor_message_voice = tutor.get("tutor_message_voice")
-    return {
-        **_phase_fields_from(result),
-        "message": tutor_message,
-        "message_voice": tutor_message_voice if isinstance(tutor_message_voice, str) else tutor_message,
-    }
-
-
-PHASE_FIELDS = (
-    "phase_changed",
-    "previous_phase",
-    "current_phase",
-    "current_question",
-    "question_id",
-    "ui_state",
-    "recommended_entry_phase",
-    "phase_transition_message",
-    "phase_transition_voice",
-)
-
-
-def _phase_fields_from(result: dict[str, object]) -> dict[str, object]:
-    """Pass the backend's phase state through to the frontend unchanged."""
-    return {key: result.get(key) for key in PHASE_FIELDS if key in result}
 
 
 def _canvas_draw_from(result: dict[str, object]) -> list[object]:
@@ -185,22 +214,33 @@ def _tts_retry_count() -> int:
         return 2
 
 
-async def synthesize_speech(text: str) -> str | None:
+async def synthesize_speech(
+    text: str,
+    provider: str | None = None,
+    voice: str | None = None,
+) -> str | None:
     """Configured TTS (OpenAI when keyed) → base64 mp3; None on empty text.
+
+    *provider* and *voice* are optional per-request overrides sent by the
+    frontend voice picker.  When ``None`` the process-level env defaults
+    (``VOICE_TTS_PROVIDER`` / ``VOICE_TTS_VOICE``) are used, so existing
+    callers that pass only ``text`` keep working unchanged.
 
     Retries provider failures per the adapter retry setting, then raises so the
     caller can return an explicit error (frontend falls back to browser speech).
     """
     if not text:
         return None
+    use_provider = provider or voice_config.DEFAULT_TTS_PROVIDER
+    use_voice = voice or voice_config.TTS_VOICE
     attempts = _tts_retry_count() + 1
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            tts_adapter = get_tts_adapter(voice_config.DEFAULT_TTS_PROVIDER)
+            tts_adapter = get_tts_adapter(use_provider)
             result = await tts_adapter.generate_speech(
                 text=text,
-                voice=voice_config.TTS_VOICE,
+                voice=use_voice,
                 audio_format="mp3",
             )
             audio_data = result.audio_data
@@ -246,10 +286,16 @@ def health():
     return {"status": "ok", "service": "voice-streaming"}
 
 @app.websocket("/voice/stream")
-async def voice_stream(ws: WebSocket, session: str = "default", student_id: str = "ST001"):
+async def voice_stream(
+    ws: WebSocket,
+    session: str = "default",
+    student_id: str = "ST001",
+    tts_provider: str | None = None,
+    tts_voice: str | None = None,
+):
     session_id = session  # frontend sends ?session=, not ?session_id=
     await ws.accept()
-    logger.info(f"[{session_id}] WebSocket connected")
+    logger.info(f"[{session_id}] WebSocket connected (tts_provider={tts_provider}, tts_voice={tts_voice})")
 
     language = "en"
     deepgram_ws = None
@@ -260,11 +306,36 @@ async def voice_stream(ws: WebSocket, session: str = "default", student_id: str 
     audio_started_at = 0.0
     turn_already_processed = False  # True when UtteranceEnd auto-triggered a response
     access_token: str | None = None
+    turn_id: str | None = None
+    previous_tutor_turn_id: str | None = None
+    transcript_final: bool | None = None
+
+    async def deepgram_keepalive() -> None:
+        # Deepgram closes a stream that receives neither audio nor text for
+        # ~10s (NET-0001). That happens on every mute, because the frontend
+        # stops sending chunks while muted — 8 such kills in the 30-31 Jul
+        # logs, each costing the student an utterance mid-conversation.
+        # The documented fix is a KeepAlive text frame; it is harmless while
+        # audio is flowing and resets the idle timer while it is not.
+        # https://developers.deepgram.com/docs/keep-alive
+        while True:
+            await asyncio.sleep(5)
+            ws_now = deepgram_ws
+            if ws_now is None:
+                continue
+            try:
+                await ws_now.send(json.dumps({"type": "KeepAlive"}))
+            except Exception:
+                # Closed or resetting mid-send; the reconnect paths own recovery.
+                pass
+
+    keepalive_task = asyncio.create_task(deepgram_keepalive())
 
     deepgram_receiver_task = None
 
     async def forward_deepgram_results(dg_ws):
         nonlocal final_transcript, final_confidence, final_segment_count, audio_started_at, turn_already_processed
+        nonlocal turn_id, previous_tutor_turn_id, transcript_final
 
         try:
             async for msg in dg_ws:
@@ -338,9 +409,16 @@ async def voice_stream(ws: WebSocket, session: str = "default", student_id: str 
                                 ws, session_id, student_id,
                                 transcript_to_process, confidence_to_process,
                                 duration, access_token, None,
+                                tts_provider, tts_voice,
+                                turn_id, previous_tutor_turn_id, transcript_final,
                             )
                         except Exception as e:
+                            turn_already_processed = False
                             logger.error(f"[{session_id}] Auto-process failed: {e}")
+                        finally:
+                            turn_id = None
+                            previous_tutor_turn_id = None
+                            transcript_final = None
 
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"[{session_id}] Deepgram connection closed")
@@ -356,6 +434,12 @@ async def voice_stream(ws: WebSocket, session: str = "default", student_id: str 
             if "text" in message:
                 data = json.loads(message["text"])
                 msg_type = data.get("type", "")
+                if "turn_id" in data:
+                    turn_id = data.get("turn_id")
+                if "previous_tutor_turn_id" in data:
+                    previous_tutor_turn_id = data.get("previous_tutor_turn_id")
+                if "transcript_final" in data:
+                    transcript_final = data.get("transcript_final")
 
                 if msg_type == "authenticate":
                     candidate = data.get("access_token")
@@ -394,17 +478,7 @@ async def voice_stream(ws: WebSocket, session: str = "default", student_id: str 
                     audio_started_at = time.time()
                     turn_already_processed = False
 
-                    params = (
-                        f"?model=nova-3"
-                        f"&language={language}"
-                        f"&smart_format=true"
-                        f"&punctuate=true"
-                        f"&interim_results=true"
-                        f"&utterance_end_ms=1500"
-                        f"&encoding=linear16"
-                        f"&sample_rate=16000"
-                        f"&channels=1"
-                    )
+                    params = _build_deepgram_params(language)
 
                     dg_url = DEEPGRAM_WS_URL + params
                     extra_headers = {
@@ -466,10 +540,17 @@ async def voice_stream(ws: WebSocket, session: str = "default", student_id: str 
                     if final_transcript:
                         logger.info(f"[{session_id}] Processing on stop: '{final_transcript}'")
                         audio_duration_seconds = max(time.time() - audio_started_at, 0.001)
-                        await process_and_respond(
-                            ws, session_id, student_id, final_transcript,
-                            final_confidence, audio_duration_seconds, access_token, canvas_snapshot
-                        )
+                        try:
+                            await process_and_respond(
+                                ws, session_id, student_id, final_transcript,
+                                final_confidence, audio_duration_seconds, access_token, canvas_snapshot,
+                                tts_provider, tts_voice,
+                                turn_id, previous_tutor_turn_id, transcript_final,
+                            )
+                        finally:
+                            turn_id = None
+                            previous_tutor_turn_id = None
+                            transcript_final = None
                     elif not turn_already_processed:
                         logger.info(f"[{session_id}] Stop: no speech detected")
 
@@ -500,17 +581,7 @@ async def voice_stream(ws: WebSocket, session: str = "default", student_id: str 
                         receiving_audio = True
                         audio_started_at = time.time()
 
-                        params = (
-                            f"?model=nova-3"
-                            f"&language={language}"
-                            f"&smart_format=true"
-                            f"&punctuate=true"
-                            f"&interim_results=true"
-                            f"&utterance_end_ms=1500"
-                            f"&encoding=linear16"
-                            f"&sample_rate=16000"
-                            f"&channels=1"
-                        )
+                        params = _build_deepgram_params(language)
                         dg_url = DEEPGRAM_WS_URL + params
                         extra_headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
                         ssl_context = ssl.create_default_context(cafile=certifi.where())
@@ -551,6 +622,7 @@ async def voice_stream(ws: WebSocket, session: str = "default", student_id: str 
     except Exception as e:
         logger.error(f"[{session_id}] Error: {e}")
     finally:
+        keepalive_task.cancel()
         if deepgram_receiver_task and not deepgram_receiver_task.done():
             deepgram_receiver_task.cancel()
         if deepgram_ws:
@@ -568,7 +640,12 @@ async def process_and_respond(
     confidence: float,
     audio_duration_seconds: float,
     access_token: str,
-    canvas_snapshot: str | None = None,
+    canvas_snapshot: str | None,
+    tts_provider: str | None,
+    tts_voice: str | None,
+    turn_id: str | None,
+    previous_tutor_turn_id: str | None,
+    transcript_final: bool | None,
 ):
     pipeline_start = time.time()
 
@@ -588,17 +665,22 @@ async def process_and_respond(
                 confidence,
                 access_token,
             )
-            tutor_response = _tutor_response_from_canvas(canvas_response)
             canvas_draw = _canvas_draw_from(canvas_response)
+            canvas_snapshot_id = str(canvas_response["submission_id"])
         else:
-            tutor_response = await evaluate_voice_transcript(
-                session_id,
-                student_id,
-                transcript,
-                confidence,
-                audio_duration_seconds,
-                access_token,
-            )
+            canvas_snapshot_id = None
+        tutor_response = await evaluate_voice_transcript(
+            session_id,
+            student_id,
+            transcript,
+            confidence,
+            audio_duration_seconds,
+            access_token,
+            turn_id,
+            previous_tutor_turn_id,
+            transcript_final,
+            canvas_snapshot_id,
+        )
         tutor_ms = int((time.time() - tutor_start) * 1000)
         logger.info(f"[{session_id}] Backend tutor call took {tutor_ms}ms")
     except Exception as e:
@@ -619,6 +701,7 @@ async def process_and_respond(
     text_sent_ms = int((time.time() - pipeline_start) * 1000)
 
     await ws.send_json({
+        **tutor_response,
         "type": "tutor_response",
         "transcript": transcript,
         "normalized_expression": normalized,
@@ -628,7 +711,6 @@ async def process_and_respond(
         "needs_clarification": confidence < voice_config.CONFIDENCE_THRESHOLD,
         "text_latency_ms": text_sent_ms,
         "canvas_draw": canvas_draw,
-        **_phase_fields_from(tutor_response),
     })
 
     logger.info(f"[{session_id}] Text sent to frontend: {text_sent_ms}ms")
@@ -637,7 +719,9 @@ async def process_and_respond(
     # Instead of waiting for the full audio file (2-3 seconds),
     # we send chunks as OpenAI generates them.  The frontend can
     # start playback after receiving the first chunk (~300-500ms).
-    tts_adapter = get_tts_adapter(voice_config.DEFAULT_TTS_PROVIDER)
+    use_provider = tts_provider or voice_config.DEFAULT_TTS_PROVIDER
+    use_voice = tts_voice or voice_config.TTS_VOICE
+    tts_adapter = get_tts_adapter(use_provider)
     supports_streaming = hasattr(tts_adapter, "generate_speech_stream")
 
     if supports_streaming and tutor_voice_text:
@@ -648,7 +732,7 @@ async def process_and_respond(
         try:
             async for chunk in tts_adapter.generate_speech_stream(
                 text=tutor_voice_text,
-                voice=voice_config.TTS_VOICE,
+                voice=use_voice,
                 audio_format="mp3",
             ):
                 chunk_b64 = base64.b64encode(chunk).decode("utf-8")
@@ -699,7 +783,7 @@ async def process_and_respond(
 
             tts_result = await tts_adapter.generate_speech(
                 text=tutor_voice_text,
-                voice=voice_config.TTS_VOICE,
+                voice=use_voice,
                 audio_format="mp3",
             )
 
