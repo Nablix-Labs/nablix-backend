@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Collection
 from dataclasses import dataclass
 from time import perf_counter
 
 import httpx
-from pydantic import Field, ValidationError
+from pydantic import Field, StrictBool, ValidationError
 
 from app.ai_engine.prompt_registry import (
     OpenAITutorPromptMetadata,
@@ -27,7 +28,15 @@ from app.ai_engine.schemas import (
 )
 from app.core.exceptions import AdapterError
 from app.core.logger import logger
-from app.models.adapters import ConversationMessage, ConversationState
+from app.models.adapters import ConversationMessage, ConversationState, Phase2PromptContext
+from app.models.guided_learning import (
+    ActiveTeachingObjective,
+    GeneratedQuestionRubric,
+    GuidedEvaluation,
+    ScaffoldEvaluationContext,
+    ScaffoldStepEvaluation,
+)
+from app.models.student_model_session import AnswerSpec, QuestionType
 
 
 _OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
@@ -41,6 +50,7 @@ class OpenAITutorTurn(StrictSchema):
     hint_level: HintLevel | None
     tutor_message: str
     tutor_message_voice_optimised: str
+    reasoning_complete: StrictBool
     confidence: float = Field(ge=0.0, le=1.0)
 
 
@@ -66,18 +76,23 @@ class OpenAIAIEngineClient:
         model: str,
         timeout_seconds: int,
         prompt_cache_key_enabled: bool,
+        store_responses: bool,
         retry_count: int,
     ) -> None:
         self._api_key = api_key
         self._model = model
         self._timeout_seconds = timeout_seconds
         self._prompt_cache_key_enabled = prompt_cache_key_enabled
+        self._store_responses = store_responses
         self._retry_count = retry_count
 
     def generate_tutor_turn(
         self,
         question: str,
         correct_answer: str,
+        answer_spec: AnswerSpec | None,
+        phase_2_prompt_context: Phase2PromptContext | None,
+        active_triggers: list[Trigger],
         student_input: str,
         phase: LearningPhase,
         input_source: InputSource,
@@ -85,6 +100,8 @@ class OpenAIAIEngineClient:
         attempt_count: int,
         current_hint_level: HintLevel | None,
         question_completed: bool,
+        answer_value_confirmed: bool,
+        reasoning_required: bool,
         grounded_intent: IntentType,
         grounded_evaluation: EvaluationCategory | None,
         grounded_error_type: ErrorType | None,
@@ -96,17 +113,29 @@ class OpenAIAIEngineClient:
             name="tutor_turn",
             schema=schema,
             phase=phase,
-            active_triggers=[],
+            active_triggers=active_triggers,
             conversation_history=conversation_history,
             user_payload={
                 "question": question,
                 "correct_answer": correct_answer,
+                "answer_spec": (
+                    answer_spec.model_dump()
+                    if answer_spec is not None
+                    else None
+                ),
+                "phase_2_context": (
+                    phase_2_prompt_context.model_dump()
+                    if phase_2_prompt_context is not None
+                    else None
+                ),
                 "student_input": student_input,
                 "input_source": input_source,
                 "transcript_confidence": transcript_confidence,
                 "attempt_count": attempt_count,
                 "current_hint_level": current_hint_level,
                 "question_completed": question_completed,
+                "answer_value_confirmed": answer_value_confirmed,
+                "reasoning_required": reasoning_required,
                 "grounded_intent": grounded_intent,
                 "grounded_evaluation": grounded_evaluation,
                 "grounded_error_type": grounded_error_type,
@@ -120,6 +149,198 @@ class OpenAIAIEngineClient:
         )
         return OpenAITutorTurn.model_validate(content)
 
+    def generate_guided_rubric(
+        self,
+        question_id: str,
+        question_type: QuestionType | None,
+        question: str,
+        answer_spec: AnswerSpec,
+        potential_errors: list[dict[str, object]],
+        target_micro_skill_ids: list[str],
+        prompt_version: str,
+        system_prompt: str,
+    ) -> GeneratedQuestionRubric:
+        answer_payload = answer_spec.model_dump()
+        cache_source = json.dumps(
+            {
+                "question_id": question_id,
+                "question_type": question_type,
+                "answer_spec": answer_payload,
+                "prompt_version": prompt_version,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        cache_key = hashlib.sha256(cache_source.encode("utf-8")).hexdigest()
+        schema = GeneratedQuestionRubric.model_json_schema()
+        content = self._request_guided_json(
+            name="guided_question_rubric",
+            schema=schema,
+            system_prompt=system_prompt,
+            user_payload={
+                "question_id": question_id,
+                "question_type": question_type,
+                "question": question,
+                "answer_spec": answer_payload,
+                "allowed_potential_errors": potential_errors,
+                "target_micro_skill_ids": target_micro_skill_ids,
+                "cache_key": cache_key,
+                "prompt_version": prompt_version,
+            },
+        )
+        try:
+            rubric = GeneratedQuestionRubric.model_validate(content)
+        except ValidationError as error:
+            raise AdapterError(
+                "openai_ai_engine",
+                f"invalid guided rubric: {error}",
+            ) from error
+        return rubric.model_copy(
+            update={
+                "question_id": question_id,
+                "cache_key": cache_key,
+                "prompt_version": prompt_version,
+            }
+        )
+
+    def evaluate_guided_turn(
+        self,
+        question_type: QuestionType | None,
+        question: str,
+        answer_spec: AnswerSpec,
+        deterministic_evaluation: EvaluationCategory | None,
+        generated_rubric: GeneratedQuestionRubric,
+        active_objective: ActiveTeachingObjective,
+        student_response: str,
+        input_source: InputSource,
+        allowed_error_codes: list[dict[str, object]],
+        recent_conversation: list[ConversationMessage],
+        validation_feedback: str | None,
+        evaluator_prompt_version: str,
+        system_prompt: str,
+    ) -> GuidedEvaluation:
+        content = self._request_guided_json(
+            name="guided_turn_evaluation",
+            schema=GuidedEvaluation.model_json_schema(),
+            system_prompt=system_prompt,
+            user_payload={
+                "question_type": question_type,
+                "question": question,
+                "answer_spec": answer_spec.model_dump(),
+                "deterministic_evaluation": deterministic_evaluation,
+                "generated_rubric": generated_rubric.model_dump(),
+                "active_objective": active_objective.model_dump(),
+                "student_response": student_response,
+                "input_source": input_source,
+                "allowed_error_codes": allowed_error_codes,
+                "recent_conversation": [
+                    message.model_dump()
+                    for message in recent_conversation
+                ],
+                "validation_feedback": validation_feedback,
+                "evaluator_prompt_version": evaluator_prompt_version,
+                "answer_reveal_allowed": False,
+            },
+        )
+        try:
+            return GuidedEvaluation.model_validate(content)
+        except ValidationError as error:
+            raise AdapterError(
+                "openai_ai_engine",
+                f"invalid guided evaluation: {error}",
+            ) from error
+
+    def evaluate_scaffold_step(
+        self,
+        context: ScaffoldEvaluationContext,
+        student_response: str,
+        input_source: InputSource,
+        system_prompt: str,
+    ) -> ScaffoldStepEvaluation:
+        content = self._request_guided_json(
+            name="scaffold_step_evaluation",
+            schema=ScaffoldStepEvaluation.model_json_schema(),
+            system_prompt=system_prompt,
+            user_payload={
+                "scaffold": context.model_dump(),
+                "student_response": student_response,
+                "input_source": input_source,
+            },
+        )
+        try:
+            return ScaffoldStepEvaluation.model_validate(content)
+        except ValidationError as error:
+            raise AdapterError(
+                "openai_ai_engine",
+                f"invalid scaffold evaluation: {error}",
+            ) from error
+
+    def _request_guided_json(
+        self,
+        name: str,
+        schema: dict[str, object],
+        system_prompt: str,
+        user_payload: dict[str, object],
+    ) -> dict[str, object]:
+        request_content = json.dumps(
+            {"component": name, **user_payload},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        request_body: dict[str, object] = {
+            "model": self._model,
+            "input": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": request_content},
+            ],
+            "store": self._store_responses,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": name,
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+        }
+        if self._prompt_cache_key_enabled:
+            request_body["prompt_cache_key"] = sha256_text(system_prompt)
+        response, latency_ms = self._post_with_retries(request_body)
+        if response.status_code != 200:
+            raise AdapterError(
+                "openai_ai_engine",
+                f"status={response.status_code} body={response.text}",
+            )
+        try:
+            response_payload = response.json()
+            usage = extract_openai_usage_metrics(response_payload)
+            logger.info(
+                "openai_guided_evaluator_usage",
+                extra={
+                    "component": name,
+                    "request_id": (
+                        response_payload.get("id")
+                        if isinstance(response_payload, dict)
+                        else None
+                    ),
+                    "model": self._model,
+                    "prompt_sha256": sha256_text(system_prompt),
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cached_tokens": usage.cached_tokens,
+                    "total_tokens": usage.total_tokens,
+                    "latency_ms": round(latency_ms, 3),
+                },
+            )
+            return json.loads(_extract_response_text(response_payload))
+        except (TypeError, ValueError, KeyError, ValidationError) as error:
+            raise AdapterError(
+                "openai_ai_engine",
+                f"unparseable guided response: {error}; body={response.text}",
+            ) from error
+
     def build_tutor_message(
         self,
         question: str,
@@ -131,6 +352,8 @@ class OpenAIAIEngineClient:
         phase: LearningPhase,
         conversation_history: list[ConversationMessage],
         canvas_context: dict[str, object] | None,
+        rejected_tutor_message: str | None,
+        validation_feedback: str | None,
     ) -> OpenAITutorMessage:
         schema = OpenAITutorMessage.model_json_schema()
         content = self._request_json(
@@ -147,6 +370,9 @@ class OpenAIAIEngineClient:
                 "response_strategy": response_strategy,
                 "hint_level": hint_level,
                 "canvas_context": canvas_context,
+                "rejected_tutor_message": rejected_tutor_message,
+                "validation_feedback": validation_feedback,
+                "answer_reveal_allowed": False,
             },
         )
         return OpenAITutorMessage.model_validate(content)
@@ -215,7 +441,7 @@ class OpenAIAIEngineClient:
         request_body = {
             "model": self._model,
             "input": messages,
-            "store": False,
+            "store": self._store_responses,
             "text": {
                 "format": {
                     "type": "json_schema",

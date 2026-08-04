@@ -2,6 +2,137 @@ low_transcript_confidence_threshold: 0.7
 confidence:
   safety_response: 0.99
   standard_response: 0.95
+guided_learning:
+  evaluation_mode: LLM_STATE_MACHINE
+  confidence_threshold: 0.75
+  state_confidence_thresholds:
+    CORRECT: 0.75
+    PARTIAL: 0.50
+    WRONG: 0.50
+    STUCK: 0.00
+    UNCLEAR: 0.00
+  maximum_retries: 2
+  stuck_escalation_count: 2
+  maximum_recent_history_turns: 6
+  rubric_prompt_version: "1.1.0"
+  evaluator_prompt_version: "1.2.0"
+  rubric_system_prompt: |
+    You create a compact assessment rubric for one mathematics question.
+    Infer concepts only from the supplied question and answer specification.
+    Use question_type as an explicit contract field. For
+    MULTI_PART_SHORT_RESPONSE, create one required concept for every distinct
+    part requested by the question, even when the canonical answer combines
+    those parts in one string.
+    For CHOICE_WITH_EXPLANATION and TRUE_FALSE_WITH_EXPLANATION, create
+    separate required concepts for the selected answer and its explanation.
+    Whenever explanation_required is true, the rubric must contain at least
+    one required answer concept and one required explanation concept.
+    Do not split one mathematical meaning into duplicate concepts merely because
+    it can be expressed with different words or symbols. Keyboard notation,
+    Unicode notation, and spoken forms may demonstrate the same concept.
+    For multi-part verification methods, create one concept for each independently
+    required part. Use stable uppercase concept IDs. The canonical answer must
+    demonstrate every required concept. Return only the requested JSON schema.
+  evaluator_system_prompt: |
+    You evaluate one student response against a supplied generated rubric.
+    Use question_type as an explicit contract field. A
+    MULTI_PART_SHORT_RESPONSE is CORRECT only after every required part has
+    been confirmed. When some parts are confirmed, return PARTIAL, preserve
+    those concepts, and ask only for the missing part.
+    For CHOICE_WITH_EXPLANATION and TRUE_FALSE_WITH_EXPLANATION, a correct
+    choice or boolean without a sufficient explanation is PARTIAL, never
+    CORRECT. Preserve the answer concept and ask only for the explanation.
+    Confidence measures certainty about the student-state classification, not
+    how correct the student's answer is. A clearly interpretable wrong answer
+    should normally be WRONG with high confidence. Use UNCLEAR only when the
+    response itself cannot be interpreted safely. When deterministic_evaluation
+    is INCORRECT, do not return UNCLEAR merely because the answer differs from
+    the canonical form; distinguish WRONG from PARTIAL using the rubric.
+    Potential-error response_patterns are authored examples. When the
+    normalised student response matches one, return WRONG and select that
+    permitted error_code with high confidence.
+    Judge mathematical meaning, not typography. Treat harmless whitespace,
+    Unicode symbols, keyboard operators, and equivalent spoken mathematical
+    notation as equivalent. In a decoding response, interpret a lowercase keyboard
+    x placed between the source operands as a multiplication sign when that reading
+    matches the expression being decoded; do not confuse it with an extra variable.
+    Evaluate the active objective first and preserve previously confirmed concepts
+    unless the student explicitly contradicts them.
+    Copy every concept ID exactly from generated_rubric or active_objective; never
+    create, rename, paraphrase, or translate a concept ID. The backend derives
+    preserved concepts, missing concepts, and the next objective from confirmed
+    and contradicted concepts. If validation_feedback is present, correct that
+    inconsistency instead of repeating the previous output.
+    CORRECT requires every required concept. PARTIAL requires at least one
+    demonstrated concept and at least one missing concept. WRONG is a definite
+    misconception; choose an error code only from the supplied list. STUCK means
+    the student says they cannot proceed. UNCLEAR means the response cannot be
+    interpreted safely. The tutor message must agree with the returned concept
+    lists: acknowledge only newly confirmed ideas and ask about only one currently
+    missing target. Never request, question, or list a preserved or confirmed
+    concept as missing. Ask one focused question, never repeat a satisfied
+    objective, never demand a particular glyph, and never reveal the final answer.
+    Always return a non-empty tutor_message and tutor_message_voice. The text
+    message must be suitable for display. The voice message must express the same
+    meaning in speech-friendly notation.
+    Return only the requested JSON schema.
+  scaffold_evaluator_system_prompt: |
+    You evaluate whether one student response satisfies the current scaffold step.
+    The expected-response field is an authored semantic criterion, not necessarily
+    a literal answer. Use the original question and canonical answer only to
+    understand the context. Mark the step satisfied when the student demonstrates
+    the requested fact, even if they also correctly answer later scaffold steps or
+    give the complete original answer. Use accepted_answers and verification_method
+    when deciding whether the original answer is correct. Do not require exact
+    wording or a particular mathematical glyph. Do not mark a step satisfied for
+    an unrelated statement, a contradiction, or an expression that does not
+    demonstrate the requested fact. Return only the requested JSON schema and
+    never include the canonical answer in demonstrated_fact. Set
+    original_answer_correct only when the response independently gives a complete
+    correct answer to the original question. When original_answer_correct is true,
+    step_satisfied must also be true.
+  answer_reveal_retry_feedback: >-
+    The previous tutor wording disclosed or directly stated the canonical answer.
+    Keep the same student-state classification and concept updates, but replace
+    both tutor messages with one focused question that helps the student supply
+    the missing idea. You may acknowledge an idea already present in the student's
+    own response, but do not state any missing answer component.
+  reconciliation_message: "I want to make sure I understood that. Please give your answer in one complete response."
+  allowed_student_states:
+    - CORRECT
+    - PARTIAL
+    - WRONG
+    - STUCK
+    - UNCLEAR
+  supported_verification_methods:
+    - EXACT_CHOICE_MATCH
+    - EXACT_NOTATION_MATCH
+    - SYMBOLIC_EQUIVALENCE
+    - CONCEPT_TEXT_MATCH
+    - STRUCTURED_TEXT_MATCH
+    - STRUCTURED_TEXT_AND_SYMBOLIC_MATCH
+    - CHOICE_AND_CONCEPT_MATCH
+    - BOOLEAN_AND_CONCEPT_MATCH
+  multi_component_question_types:
+    - MULTI_PART_SHORT_RESPONSE
+    - CHOICE_WITH_EXPLANATION
+    - TRUE_FALSE_WITH_EXPLANATION
+  llm_state_mapping:
+    CORRECT:
+      student_model_event: CORRECT_ATTEMPT
+      strategy: null
+    PARTIAL:
+      student_model_event: null
+      strategy: AFFIRM_THEN_ISOLATE
+    WRONG:
+      student_model_event: INCORRECT_ATTEMPT
+      strategy: null
+    STUCK:
+      student_model_event: null
+      strategy: LOAD_REDUCTION
+    UNCLEAR:
+      student_model_event: null
+      strategy: REQUEST_CLARIFICATION
 safety:
   unsafe_terms:
     - hurt myself
@@ -22,6 +153,8 @@ intent_phrases:
     - hint
     - help me
   EXPRESSING_CONFUSION:
+    - i don't know
+    - i do not know
     - i do not understand
     - i don't understand
     - confused
@@ -115,8 +248,29 @@ strategy_rules:
   review_phase: REVIEW
   guided_practice_phase: GUIDED_PRACTICE
   independent_practice_phase: INDEPENDENT_PRACTICE
+  stuck_scaffold_min_count: 2
   scaffold_min_attempt_count: 3
   worked_example_min_attempt_count: 4
+scaffold_response_rules:
+  aliases:
+    "½":
+      - "1/2"
+      - "one half"
+      - "half"
+    "⅓":
+      - "1/3"
+      - "one third"
+    "before x":
+      - "in front of x"
+      - "before the letter"
+      - "in front of the letter"
+    "½x":
+      - "1/2 x"
+      - "one half x"
+      - "half x"
+    "⅓y":
+      - "1/3 y"
+      - "one third y"
 visual_cue_rules:
   enabled_response_strategies:
     - GUIDED_HINT
@@ -163,6 +317,11 @@ answer_reveal_guardrail:
     - solution is
     - so x =
     - therefore x =
+  rewrite_feedback: >-
+    The previous tutor message disclosed or directly stated the answer. Rewrite it
+    as one focused, conversational question about the student's next step. Do not
+    state the final answer or any missing answer component, and do not repeat the
+    rejected wording.
   safe_message: I cannot give the final answer, but I can help you with the next step.
   flag_type: DIRECT_ANSWER_REVEALED
   action_taken: SAFE_MESSAGE_RETURNED
@@ -180,6 +339,53 @@ conversation_rules:
     - correct
     - thanks
     - thank you
+reasoning_completion:
+  required_phases:
+    - DIAGNOSTIC
+    - CONCEPT_ORIENTATION
+    - GUIDED_PRACTICE
+    - INDEPENDENT_PRACTICE
+    - REVIEW
+  explanation_terms:
+    - because
+    - both sides
+    - inverse operation
+    - opposite operation
+    - cancel
+    - isolate
+    - get x by itself
+    - move
+    - add
+    - added
+    - subtract
+    - subtracted
+    - minus
+    - multiply
+    - multiplied
+    - divide
+    - divided
+    - substitute
+    - substituted
+    - simplify
+    - simplified
+  operation_terms:
+    - add
+    - added
+    - subtract
+    - subtracted
+    - minus
+    - multiply
+    - multiplied
+    - divide
+    - divided
+    - inverse operation
+    - opposite operation
+  minimum_explanation_words: 4
+  minimum_canvas_steps: 2
+  explanation_required_message: Your value is correct. How did you work it out?
+  explanation_incomplete_message: Your value is correct. Explain which operation you used and why.
+  explanation_reason_message: Why was that operation the right one for this equation?
+  explanation_accepted_message: Thanks for explaining your method. Let us continue.
 canvas_review:
   min_region_confidence: 0.75
   max_expression_characters: 160
@@ -250,3 +456,6 @@ messages:
   QUESTION_COMPLETE_ACKNOWLEDGEMENT: You are welcome. This question is complete, so let us continue to the next question.
   CONTEXTUAL_ACKNOWLEDGEMENT: Exactly. Let us move to the next question.
   QUESTION_ALREADY_COMPLETE: This question is already complete. Let us continue to the next question.
+  NEXT_QUESTION: "Here is the next question. Please solve it: {question}"
+  SCAFFOLD_STEP_RETRY: "Let’s stay with this step: {step}"
+  SCAFFOLD_ORIGINAL_RETRY: Now use those steps on the original question. What would you try first?
