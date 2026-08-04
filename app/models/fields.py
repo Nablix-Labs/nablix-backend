@@ -11,7 +11,9 @@ from app.core.config import get_settings
 def _check_session_id(value: str) -> str:
     settings = get_settings()
     if re.fullmatch(settings.session_id_pattern, value) is None:
-        raise ValueError("session_id must use the SESSION### format.")
+        raise ValueError(
+            "session_id must use SESSION followed by three digits or a UUID hex string."
+        )
     return value
 
 
@@ -63,6 +65,7 @@ SnapshotDataUrl = Annotated[str, AfterValidator(_check_snapshot_data_url)]
 # Non-empty for now; tighten to a pattern when the concept catalog is defined.
 ConceptId = NonEmptyText
 QuestionId = NonEmptyText
+TurnId = NonEmptyText
 
 # Shared enums from the Chirudeva module guide (Submodules 6.1-6.4).
 Phase = Literal[
@@ -75,9 +78,14 @@ Phase = Literal[
 InteractionMode = Literal["VOICE", "TEXT"]
 InteractionType = Literal[
     "ANSWER_SUBMISSION",
-    "HINT_REQUEST",
     "CANVAS_SUBMISSION",
+    "EXPLAIN_AGAIN",
+    "INACTIVITY_NUDGE",
+    "NUDGE_PRESENTED",
+    "HELP_REQUEST",
+    "SUPPORT_REPLAY",
+    "CLARIFICATION",
     "SESSION_START",
     "SESSION_END",
 ]
-InputSource = Literal["TEXT", "VOICE"]
+InputSource = Literal["TEXT", "VOICE", "CANVAS", "SYSTEM"]
