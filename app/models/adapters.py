@@ -10,6 +10,14 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.models.student_model_session import AnswerSpec, QuestionType
+from app.models.guided_learning import (
+    ActiveTeachingObjective,
+    GeneratedQuestionRubric,
+    GuidedStudentState,
+    ScaffoldEvaluationContext,
+)
+
 MasteryStatus = Literal[
     "NEW_LEARNER",
     "DEVELOPING",
@@ -17,6 +25,7 @@ MasteryStatus = Literal[
     "MASTERED",
     "LEARNING_GAP",
     "REVIEW_DUE",
+    "RESTART_RECOMMENDED",
 ]
 ContinuityStatus = Literal[
     "on_track",
@@ -45,6 +54,7 @@ ConversationAction = Literal[
     "ASK_QUESTION",
     "GIVE_HINT",
     "ACKNOWLEDGE_ANSWER",
+    "REQUEST_EXPLANATION",
     "REQUEST_CLARIFICATION",
     "ADVANCE_TO_NEXT_QUESTION",
     "WAIT_FOR_STUDENT",
@@ -58,6 +68,18 @@ class ConversationState(BaseModel):
     expected_student_response: ExpectedStudentResponse
 
 
+class Phase2PromptContext(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    target_micro_skill_ids: list[str]
+    support_state: dict[str, object]
+    potential_errors: list[dict[str, object]]
+    support_catalog: dict[str, object]
+    current_support: dict[str, object] | None
+    current_scaffold_step_number: int
+    consecutive_stuck_count: int
+
+
 class AdapterContext(BaseModel):
     """Shared input for the three text adapters (tutor, RAG, student model).
 
@@ -67,15 +89,21 @@ class AdapterContext(BaseModel):
 
     session_id: str
     student_id: str
+    source_turn_id: str | None = None
+    question_id: str | None = None
+    question_type: QuestionType | None = None
     message: str
     question: str | None = None
     correct_answer: str | None = None
+    answer_spec: AnswerSpec | None = None
+    phase_2_prompt_context: Phase2PromptContext | None = None
     current_phase: str | None = None
     input_source: str | None = None
     transcript_confidence: float | None = None
     attempt_count: int | None = None
     independent_correct_in_session: int = 0
     question_completed: bool = False
+    answer_value_confirmed: bool = False
     question_number: int | None = None
     current_hint_level: int | None = None
     concept_id: str | None = None
@@ -85,6 +113,9 @@ class AdapterContext(BaseModel):
     canvas_regions: list["OCRTextRegion"] = Field(default_factory=list)
     conversation_history: list["ConversationMessage"] = Field(default_factory=list)
     conversation_state: ConversationState | None = None
+    generated_question_rubric: GeneratedQuestionRubric | None = None
+    active_teaching_objective: ActiveTeachingObjective | None = None
+    scaffold_evaluation_context: ScaffoldEvaluationContext | None = None
 
 
 class ConversationMessage(BaseModel):
@@ -141,6 +172,7 @@ class VisualCue(BaseModel):
     show: bool = False
     cue_type: str | None = None
     description: str | None = None
+    actions: list[dict[str, object]] = Field(default_factory=list)
 
 
 class CanvasStepFeedback(BaseModel):
@@ -199,9 +231,16 @@ class TutorResult(BaseModel):
     transcript_confidence: float | None = None
     safety_check: SafetyCheckResult = Field(default_factory=lambda: SafetyCheckResult(passed=True))
     student_model_events: list[StudentModelEvent] = Field(default_factory=list)
-    attempt_increment: int = Field(default=0, ge=0, le=1)
-    recommended_conversation_action: ConversationAction = "WAIT_FOR_STUDENT"
-    question_completed: bool = False
+    attempt_increment: int = Field(ge=0, le=1)
+    recommended_conversation_action: ConversationAction
+    question_completed: bool
+    answer_value_confirmed: bool = False
+    reasoning_complete: bool = False
+    guided_student_state: GuidedStudentState | None = None
+    selected_error_code: str | None = None
+    generated_question_rubric: GeneratedQuestionRubric | None = None
+    active_teaching_objective: ActiveTeachingObjective | None = None
+    scaffold_original_answer_correct: bool = False
 
 
 class VoiceResult(BaseModel):
