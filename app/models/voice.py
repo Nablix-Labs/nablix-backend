@@ -3,7 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, field_validator
 
-from app.models.fields import BoundedText, NonEmptyText, SessionId, StudentId
+from app.models.fields import BoundedText, NonEmptyText, SessionId, StudentId, TurnId
 
 
 class VoiceRequest(BaseModel):
@@ -15,9 +15,16 @@ class VoiceRequest(BaseModel):
 
 
 class VoiceTTSRequest(BaseModel):
-    """Text to synthesize into tutor speech (e.g. for the Canvas Check button)."""
+    """Text to synthesize into tutor speech (e.g. for the Canvas Check button).
+
+    provider and voice are optional overrides sent by the frontend voice
+    picker.  When absent the server falls back to the process-level env
+    defaults (VOICE_TTS_PROVIDER / VOICE_TTS_VOICE).
+    """
 
     text: NonEmptyText
+    provider: str | None = None
+    voice: str | None = None
 
 
 class VoiceResponse(BaseModel):
@@ -58,6 +65,10 @@ class VoiceTranscriptRequest(BaseModel):
     audio_duration_seconds: float
     turn: Literal["STUDENT"]
     timestamp: datetime
+    turn_id: TurnId
+    previous_tutor_turn_id: TurnId | None = None
+    transcript_final: Literal[True]
+    canvas_snapshot_id: str | None = None
 
     @field_validator("confidence")
     @classmethod
