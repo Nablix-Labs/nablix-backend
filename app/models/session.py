@@ -1,24 +1,36 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.adapters import (
     CanvasFeedback,
     ConversationMessage,
+    ExpectedStudentResponse,
     StudentModelResult,
+    TutorAction,
     VisionOCRResult,
 )
 from app.models.canvas import CanvasSubmissionRecord
-from app.models.session_review import SessionReviewResponse
 from app.models.fields import (
     ConceptId,
     InteractionMode,
+    NonEmptyText,
     Phase,
     QuestionId,
     SessionId,
     StudentId,
+    TurnId,
 )
+from app.models.guided_learning import ActiveTeachingObjective, GeneratedQuestionRubric
+from app.models.session_review import SessionReviewResponse
+from app.models.student_model_session import (
+    PublicStudentModelEvent,
+    QuestionType,
+    StudentModelCoreState,
+    StudentModelSessionEventResponse,
+)
+from app.services.phase1_tutor import Phase1TutorMessages
 
 
 class VoiceState(BaseModel):
@@ -52,6 +64,34 @@ class SessionEndRequest(BaseModel):
 
     session_id: SessionId
     student_id: StudentId
+
+
+class DiagnosticAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: QuestionId
+    student_response: NonEmptyText
+
+
+class DiagnosticCompleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    student_id: StudentId
+    answers: list[DiagnosticAnswer]
+
+
+class OrientationPhaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    student_id: StudentId
+
+
+class OrientationCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    student_id: StudentId
+    completed_video_ids: list[NonEmptyText]
+    completed_worked_example_ids: list[NonEmptyText]
 
 
 class QuestionAttemptRecord(BaseModel):
@@ -110,8 +150,9 @@ class SessionRecord(BaseModel):
     started_at: datetime
     current_phase: Phase
     previous_phase: Phase | None = None
-    current_question: str
-    question_id: QuestionId
+    current_question: str | None
+    question_type: QuestionType | None = None
+    question_id: QuestionId | None
     question_number: int
     # Answer key served with the question (Qdrant payload or demo stub).
     correct_answer: str | None = None
@@ -122,6 +163,9 @@ class SessionRecord(BaseModel):
     canvas_state: CanvasState = Field(default_factory=CanvasState)
     ui_state: str
     message: str
+    diagnostic_transition_message: str | None = None
+    diagnostic_transition_messages: list[str] = Field(default_factory=list)
+    orientation_messages: Phase1TutorMessages | None = None
     show_canvas: bool = True
     show_hint_button: bool = False
     show_visual_cue: bool = False
@@ -131,9 +175,30 @@ class SessionRecord(BaseModel):
     allow_voice_input: bool = True
     hint_count: int
     attempt_count: int = 0
+    interaction_state_version: int = 0
+    nudge_generated_count: int = 0
+    nudge_presented_count: int = 0
+    stuck_count: int = 0
+    # Consecutive REQUEST_EXPLANATION turns on the current question. PARTIAL
+    # explanation turns carry attempt_increment=0, so without this nothing
+    # counts them and nothing can cap them (31 Jul: 29 consecutive rejections
+    # of a reasonable explanation, session unwinnable).
+    explanation_request_count: int = 0
+    generated_question_rubric: GeneratedQuestionRubric | None = None
+    active_teaching_objective: ActiveTeachingObjective | None = None
     question_completed: bool = False
+    answer_value_confirmed: bool = False
     conversation_history: list[ConversationMessage] = Field(default_factory=list)
+    last_processed_turn_id: TurnId | None = None
+    last_tutor_turn_id: TurnId | None = None
+    last_tutor_action: TutorAction = "ASKED_QUESTION"
+    expected_student_response: ExpectedStudentResponse = "ANSWER"
+    scaffold_id: str | None = None
+    current_scaffold_step_id: str | None = None
     scaffold_step_number: int = 0
+    scaffold_total_steps: int = 0
+    delivered_scaffold_step_ids: list[str] = Field(default_factory=list)
+    scaffold_expected_response: str | None = None
     rescue_mode_active: bool = False
     mastery_check_question_count: int = 0
     # Functional fields the guide omits but the backend needs.
@@ -147,5 +212,24 @@ class SessionRecord(BaseModel):
     # Last learner-state snapshot from Saravanan's service, kept so the
     # end-of-session review reflects his data rather than a reconstruction.
     last_student_model: StudentModelResult | None = None
+    student_model_event: StudentModelSessionEventResponse | None = None
+    student_model_state: StudentModelCoreState | None = None
     session_summary: SessionSummary | None = None
     session_review: SessionReviewResponse | None = None
+
+
+class SessionResponse(SessionRecord):
+    model_config = ConfigDict(from_attributes=True)
+
+    correct_answer: str | None = Field(default=None, exclude=True)
+    scaffold_steps: list[str] = Field(default_factory=list, exclude=True)
+    scaffold_expected_response: str | None = Field(default=None, exclude=True)
+    student_model_event: PublicStudentModelEvent | None = None
+    generated_question_rubric: GeneratedQuestionRubric | None = Field(
+        default=None,
+        exclude=True,
+    )
+    active_teaching_objective: ActiveTeachingObjective | None = Field(
+        default=None,
+        exclude=True,
+    )
