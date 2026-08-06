@@ -1,5 +1,6 @@
 import json
 import logging
+from typing import cast
 
 from fastapi.testclient import TestClient
 import pytest
@@ -8,13 +9,22 @@ from app.adapters.tutor_engine import TutorEngineServiceAdapter, apply_retrieved
 from app.ai_engine import classifier, openai_client
 from app.ai_engine.classifier import ClassificationRequest, classify_student_response
 from app.ai_engine.prompt_registry import (
+    Trigger,
     build_openai_tutor_messages,
     build_openai_tutor_prompt_metadata,
     load_prompt_registry,
     serialize_session_context,
 )
-from app.ai_engine.schemas import CanvasTextRegion
+from app.ai_engine.schemas import (
+    ActiveScaffoldState,
+    CanvasTextRegion,
+    ExplainAgainRequest,
+    OpenAIExplainAgainMessage,
+    RecordedMisconception,
+    VisualCue,
+)
 from app.core.config import Settings, get_settings
+from app.core.exceptions import AdapterError
 from app.core.logger import StructuredJsonFormatter
 from app.main import app, prompt_registry as startup_prompt_registry
 from app.models.adapters import (
@@ -22,15 +32,421 @@ from app.models.adapters import (
     ConversationMessage,
     ConversationState,
     OCRTextRegion,
+    Phase2PromptContext,
     RAGResult,
     RetrievedDocument,
     StudentModelResult,
     TutorEngineRequest,
 )
 from app.models.student_model_session import AnswerSpec
+from app.models.guided_learning import (
+    ActiveTeachingObjective,
+    GeneratedConcept,
+    GeneratedQuestionRubric,
+    GuidedEvaluation,
+    ScaffoldEvaluationContext,
+    ScaffoldStepEvaluation,
+)
 
 
 client = TestClient(app)
+
+
+def _guided_context(stuck_count: int) -> Phase2PromptContext:
+    return Phase2PromptContext(
+        target_micro_skill_ids=["T02.M8"],
+        support_state={},
+        potential_errors=[
+            {
+                "error_code": "ERR-T02-ADDITION",
+                "description": "Interprets adjacent terms as addition.",
+                "response_patterns": ["c + d"],
+            }
+        ],
+        support_catalog={"hints": [{"hint_id": "PRIVATE-FUTURE-HINT"}]},
+        current_support=None,
+        current_scaffold_step_number=0,
+        consecutive_stuck_count=stuck_count,
+    )
+
+
+def _guided_rubric() -> GeneratedQuestionRubric:
+    return GeneratedQuestionRubric(
+        question_id="Q-T02-002",
+        required_concepts=[
+            GeneratedConcept(
+                concept_id="OPERATION",
+                description="Recognises multiplication.",
+                required=True,
+            ),
+            GeneratedConcept(
+                concept_id="EXPANDED_MEANING",
+                description="Expands adjacent letters.",
+                required=True,
+            ),
+        ],
+        completion_rule="ALL_REQUIRED_CONCEPTS",
+        cache_key="rubric-hash",
+        prompt_version="1.0.0",
+    )
+
+
+def _multipart_guided_rubric() -> GeneratedQuestionRubric:
+    return GeneratedQuestionRubric(
+        question_id="Q-T01-006",
+        required_concepts=[
+            GeneratedConcept(
+                concept_id="GENERAL_RULE",
+                description="States the general rule c + 4.",
+                required=True,
+            ),
+            GeneratedConcept(
+                concept_id="CHANGING_VALUE",
+                description="Identifies c as changing.",
+                required=True,
+            ),
+            GeneratedConcept(
+                concept_id="FIXED_INCREMENT",
+                description="Identifies +4 as fixed.",
+                required=True,
+            ),
+        ],
+        completion_rule="ALL_REQUIRED_CONCEPTS",
+        cache_key="multipart-rubric",
+        prompt_version="1.0.0",
+    )
+
+
+def _explain_again_request() -> ExplainAgainRequest:
+    return ExplainAgainRequest(
+        question_id="Q-T01-006",
+        question="A counter starts at c and increases by 4. State the general rule and explain what changes and stays fixed.",
+        answer_spec=AnswerSpec(
+            answer_spec_id="ANS-T01-006",
+            canonical_answer="c + 4; c changes; add 4 stays fixed",
+            accepted_answers=["c + 4"],
+            verification_method="STRUCTURED_TEXT_AND_SYMBOLIC_MATCH",
+            explanation_required=True,
+        ),
+        generated_question_rubric=_multipart_guided_rubric(),
+        active_teaching_objective=ActiveTeachingObjective(
+            objective_type="EXPLAIN_CONCEPT",
+            target_concept_ids=["CHANGING_VALUE", "FIXED_INCREMENT"],
+            confirmed_concept_ids=["GENERAL_RULE"],
+            missing_concept_ids=["CHANGING_VALUE", "FIXED_INCREMENT"],
+        ),
+        first_unresolved_concept_id="CHANGING_VALUE",
+        guided_student_state="PARTIAL",
+        selected_error_code="ERR-T01-COUNTER-RULE",
+        recorded_misconception=RecordedMisconception(
+            error_code="ERR-T01-COUNTER-RULE",
+            description="Treats c as fixed rather than a starting value.",
+        ),
+        recent_conversation=[
+            ConversationMessage(role="user", content="The rule is c + 4."),
+            ConversationMessage(role="assistant", content="What can c represent?"),
+        ],
+        active_support_level="SCAFFOLD",
+        highest_support_used="SCAFFOLD",
+        visible_visual_cue=VisualCue(
+            show=True,
+            cue_type="CONCEPT_CARD",
+            description="A counter can start at different values.",
+            actions=[],
+        ),
+        active_scaffold=ActiveScaffoldState(
+            scaffold_id="SCF-T01-COUNTER-RULE",
+            current_step_id="SCF-T01-CTR-S1",
+            step_number=1,
+            total_steps=4,
+            step_text="Which quantity can change?",
+            step_voice="Which quantity can change?",
+        ),
+        answer_reveal_allowed=False,
+    )
+
+
+def test_explain_again_reexpresses_the_unresolved_component_without_progression_change(
+    monkeypatch,
+) -> None:
+    captured_requests: list[ExplainAgainRequest] = []
+
+    class _ExplainAgainClient:
+        def generate_explain_again_message(
+            self,
+            request: ExplainAgainRequest,
+            **kwargs: object,
+        ) -> OpenAIExplainAgainMessage:
+            captured_requests.append(request)
+            messages = [
+                "Look at the counter card: c is the starting value, so what could make it different each time?",
+                "Use the first scaffold question again: how could the counter begin at one value today and another tomorrow?",
+            ]
+            message = messages[len(captured_requests) - 1]
+            return OpenAIExplainAgainMessage(
+                tutor_message=message,
+                tutor_message_voice_optimised=message,
+                answer_reveal_risk=False,
+                confidence=0.96,
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _ExplainAgainClient(),
+    )
+
+    first = classifier.generate_explain_again_response(_explain_again_request())
+    second = classifier.generate_explain_again_response(_explain_again_request())
+
+    assert len(captured_requests) == 2
+    assert captured_requests[0].generated_question_rubric.required_concepts[1].concept_id == "CHANGING_VALUE"
+    assert captured_requests[0].active_scaffold is not None
+    assert captured_requests[0].visible_visual_cue is not None
+    assert first.tutor_message != second.tutor_message
+    assert first.attempt_increment == 0
+    assert first.progression_change_requested is False
+    assert first.support_served_this_turn is None
+    assert first.guided_student_state == "PARTIAL"
+    assert first.active_teaching_objective.confirmed_concept_ids == ["GENERAL_RULE"]
+    assert first.first_unresolved_concept_id == "CHANGING_VALUE"
+    assert first.active_support_level == "SCAFFOLD"
+    assert first.highest_support_used == "SCAFFOLD"
+    assert first.active_scaffold is not None
+
+
+def test_explain_again_retries_a_revealing_llm_response_without_canned_wording(
+    monkeypatch,
+) -> None:
+    validation_feedback: list[str | None] = []
+
+    class _ExplainAgainClient:
+        def generate_explain_again_message(
+            self,
+            **kwargs: object,
+        ) -> OpenAIExplainAgainMessage:
+            validation_feedback.append(cast(str | None, kwargs["validation_feedback"]))
+            if len(validation_feedback) == 1:
+                return OpenAIExplainAgainMessage(
+                    tutor_message="A counter can begin with any c and always moves on by four.",
+                    tutor_message_voice_optimised="A counter can begin with any c and always moves on by four.",
+                    answer_reveal_risk=True,
+                    confidence=0.99,
+                )
+            return OpenAIExplainAgainMessage(
+                tutor_message="Think about the starting value: could it be the same every time?",
+                tutor_message_voice_optimised="Think about the starting value: could it be the same every time?",
+                answer_reveal_risk=False,
+                confidence=0.98,
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _ExplainAgainClient(),
+    )
+
+    response = classifier.generate_explain_again_response(_explain_again_request())
+
+    assert len(validation_feedback) == 2
+    assert validation_feedback[0] is None
+    assert validation_feedback[1] == classifier.load_classifier_rules().answer_reveal_guardrail.rewrite_feedback
+    assert response.tutor_message == "Think about the starting value: could it be the same every time?"
+    assert response.attempt_increment == 0
+    assert response.progression_change_requested is False
+
+
+@pytest.mark.parametrize(
+    ("request_update", "expected_message"),
+    [
+        (
+            {
+                "first_unresolved_concept_id": "FIXED_INCREMENT",
+            },
+            "out of runtime rubric order",
+        ),
+        (
+            {
+                "active_teaching_objective": ActiveTeachingObjective(
+                    objective_type="EXPLAIN_CONCEPT",
+                    target_concept_ids=["CHANGING_VALUE"],
+                    confirmed_concept_ids=["GENERAL_RULE"],
+                    missing_concept_ids=["CHANGING_VALUE"],
+                )
+            },
+            "omits runtime required components",
+        ),
+        (
+            {
+                "active_teaching_objective": ActiveTeachingObjective(
+                    objective_type="EXPLAIN_CONCEPT",
+                    target_concept_ids=["CHANGING_VALUE", "FIXED_INCREMENT"],
+                    confirmed_concept_ids=["GENERAL_RULE", "CHANGING_VALUE"],
+                    missing_concept_ids=["CHANGING_VALUE", "FIXED_INCREMENT"],
+                )
+            },
+            "overlaps confirmed and missing",
+        ),
+        (
+            {
+                "selected_error_code": None,
+            },
+            "must both be present or absent",
+        ),
+        (
+            {
+                "recorded_misconception": None,
+            },
+            "must both be present or absent",
+        ),
+        (
+            {
+                "recorded_misconception": RecordedMisconception(
+                    error_code="ERR-OTHER",
+                    description="A different recorded misconception.",
+                ),
+            },
+            "does not match selected error",
+        ),
+        (
+            {
+                "active_support_level": "SCAFFOLD",
+                "highest_support_used": "HINT",
+            },
+            "active support exceeds highest support",
+        ),
+        (
+            {
+                "active_scaffold": ActiveScaffoldState(
+                    scaffold_id="SCF-T01-COUNTER-RULE",
+                    current_step_id="SCF-T01-CTR-S4",
+                    step_number=5,
+                    total_steps=4,
+                    step_text="Which quantity can change?",
+                    step_voice="Which quantity can change?",
+                )
+            },
+            "scaffold step exceeds total steps",
+        ),
+    ],
+)
+def test_explain_again_rejects_invalid_persisted_state_contract(
+    request_update: dict[str, object],
+    expected_message: str,
+) -> None:
+    request = _explain_again_request().model_copy(update=request_update)
+
+    with pytest.raises(AdapterError, match=expected_message):
+        classifier.validate_explain_again_request(request)
+
+
+def test_explain_again_rejects_duplicate_runtime_component_contract() -> None:
+    required_components = [
+        GeneratedConcept(
+            concept_id="GENERAL_RULE",
+            required=True,
+            description="States the general rule.",
+        ),
+        GeneratedConcept(
+            concept_id="GENERAL_RULE",
+            required=True,
+            description="Explains the changing value.",
+        ),
+    ]
+    request = _explain_again_request().model_copy(
+        update={
+            "generated_question_rubric": _explain_again_request().generated_question_rubric.model_copy(
+                update={"required_concepts": required_components}
+            )
+        }
+    )
+
+    with pytest.raises(AdapterError, match="unique runtime component IDs"):
+        classifier.validate_explain_again_request(request)
+
+
+def test_explain_again_rejects_optional_component_in_active_objective() -> None:
+    request = _explain_again_request()
+    components = [
+        component.model_copy(update={"required": False})
+        if component.concept_id == "FIXED_INCREMENT"
+        else component
+        for component in request.generated_question_rubric.required_concepts
+    ]
+    invalid = request.model_copy(
+        update={
+            "generated_question_rubric": request.generated_question_rubric.model_copy(
+                update={"required_concepts": components}
+            )
+        }
+    )
+
+    with pytest.raises(AdapterError, match="unknown runtime component IDs"):
+        classifier.validate_explain_again_request(invalid)
+
+
+def test_explain_again_limits_typed_conversation_history(monkeypatch) -> None:
+    captured_history: list[ConversationMessage] = []
+
+    class _ExplainAgainClient:
+        def generate_explain_again_message(
+            self,
+            request: ExplainAgainRequest,
+            **kwargs: object,
+        ) -> OpenAIExplainAgainMessage:
+            captured_history.extend(request.recent_conversation)
+            return OpenAIExplainAgainMessage(
+                tutor_message="Could the counter start at the same value every time?",
+                tutor_message_voice_optimised="Could the counter start at the same value every time?",
+                answer_reveal_risk=False,
+                confidence=0.96,
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _ExplainAgainClient(),
+    )
+    request = _explain_again_request().model_copy(
+        update={
+            "recent_conversation": [
+                ConversationMessage(role="user", content=f"turn {index}")
+                for index in range(8)
+            ]
+        }
+    )
+
+    classifier.generate_explain_again_response(request)
+
+    assert len(captured_history) == classifier.load_classifier_rules().guided_learning.maximum_recent_history_turns
+    assert captured_history[0].content == "turn 2"
+
+
+def test_explain_again_requires_an_enabled_llm_client() -> None:
+    with pytest.raises(AdapterError, match="Explain Again requires an enabled OpenAI"):
+        classifier.generate_explain_again_response(_explain_again_request())
+
+
+def test_guided_evaluation_schema_rejects_blank_tutor_messages() -> None:
+    payload = {
+        "student_state": "WRONG",
+        "newly_confirmed_concept_ids": [],
+        "preserved_concept_ids": [],
+        "contradicted_concept_ids": [],
+        "missing_concept_ids": ["OPERATION", "EXPANDED_MEANING"],
+        "selected_error_code": "ERR-T02-ADDITION",
+        "confidence": 0.95,
+        "next_objective": None,
+        "tutor_message": "",
+        "tutor_message_voice": "",
+    }
+
+    with pytest.raises(ValueError):
+        GuidedEvaluation.model_validate(payload)
+
+    schema = GuidedEvaluation.model_json_schema()
+    assert schema["properties"]["tutor_message"]["minLength"] == 1
+    assert schema["properties"]["tutor_message_voice"]["minLength"] == 1
 
 
 def _answer_spec(
@@ -100,6 +516,78 @@ def test_exact_notation_match_accepts_caret_exponent_and_cannot_be_overridden(
     assert response.tutor_message == "Correct. Nice work explaining your answer."
 
 
+@pytest.mark.parametrize(
+    ("student_input", "canonical_answer", "accepted_answers"),
+    [
+        (
+            "1/2 is multiplying x, so it's 1/2x",
+            "½x",
+            ["½x", "(1/2)x"],
+        ),
+        ("I think the answer is p squared, so p^2q.", "p²q", ["p^2q"]),
+        ("The compact expression is 4y.", "4y", ["4y"]),
+    ],
+)
+def test_exact_notation_match_accepts_notation_inside_spoken_response(
+    student_input: str,
+    canonical_answer: str,
+    accepted_answers: list[str],
+) -> None:
+    response = classify_student_response(
+        ClassificationRequest(
+            question="Write the expression in compact notation.",
+            correct_answer=canonical_answer,
+            answer_spec=_answer_spec(
+                canonical_answer=canonical_answer,
+                accepted_answers=accepted_answers,
+                verification_method="EXACT_NOTATION_MATCH",
+            ),
+            student_input=student_input,
+            current_phase="GUIDED_PRACTICE",
+            input_source="VOICE",
+            transcript_confidence=0.95,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.evaluation == "CORRECT"
+    assert response.question_completed is True
+
+
+@pytest.mark.parametrize(
+    "student_input",
+    [
+        "I think it might be 1/2 + x.",
+        "The answer is x minus 1/2.",
+        "I can see 1/2, but I do not know the answer.",
+    ],
+)
+def test_exact_notation_match_rejects_wrong_or_incomplete_spoken_response(
+    student_input: str,
+) -> None:
+    response = classify_student_response(
+        ClassificationRequest(
+            question="Write one half times x in compact notation.",
+            correct_answer="½x",
+            answer_spec=_answer_spec(
+                canonical_answer="½x",
+                accepted_answers=["½x", "(1/2)x"],
+                verification_method="EXACT_NOTATION_MATCH",
+            ),
+            student_input=student_input,
+            current_phase="GUIDED_PRACTICE",
+            input_source="VOICE",
+            transcript_confidence=0.95,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.evaluation != "CORRECT"
+    assert response.question_completed is False
+
+
 def test_symbolic_equivalence_accepts_reordered_addition() -> None:
     response = classify_student_response(
         ClassificationRequest(
@@ -160,11 +648,21 @@ def test_semantic_verification_sends_full_answer_spec_to_llm(monkeypatch) -> Non
         ],
         verification_method="CONCEPT_TEXT_MATCH",
     )
+    phase_2_context = Phase2PromptContext(
+        target_micro_skill_ids=["T02.M8"],
+        support_state={"highest_support_used_by_skill": {"T02.M8": "HINT"}},
+        potential_errors=[{"error_code": "VARIABLE_MEANING_INCOMPLETE"}],
+        support_catalog={"hints": [{"hint_id": "H-T02-M8-01"}]},
+        current_support={"support_type": "HINT"},
+        current_scaffold_step_number=0,
+        consecutive_stuck_count=0,
+    )
     response = classify_student_response(
         ClassificationRequest(
             question="In Total = n + 4, what does n represent?",
             correct_answer=answer_spec.canonical_answer,
             answer_spec=answer_spec,
+            phase_2_prompt_context=phase_2_context,
             student_input="the counters",
             current_phase="GUIDED_PRACTICE",
             input_source="TEXT",
@@ -175,8 +673,47 @@ def test_semantic_verification_sends_full_answer_spec_to_llm(monkeypatch) -> Non
     )
 
     assert captured["answer_spec"] == answer_spec
+    assert captured["phase_2_prompt_context"] == phase_2_context
     assert response.evaluation == "PARTIALLY_CORRECT"
     assert response.tutor_message.startswith("You identified the counters.")
+
+
+def test_protocol_triggers_are_derived_from_input_confidence() -> None:
+    rules = classifier.load_classifier_rules()
+    voice_request = ClassificationRequest(
+        question="Solve x + 4 = 9.",
+        correct_answer="x = 5",
+        student_input="x maybe five",
+        current_phase="GUIDED_PRACTICE",
+        input_source="VOICE",
+        transcript_confidence=0.2,
+        attempt_count=1,
+        current_hint_level=None,
+    )
+    canvas_request = voice_request.model_copy(
+        update={
+            "input_source": "CANVAS",
+            "transcript_confidence": None,
+            "canvas_regions": [
+                CanvasTextRegion(
+                    step_id="step-1",
+                    text="x + 4",
+                    x=0.1,
+                    y=0.1,
+                    w=0.2,
+                    h=0.1,
+                    confidence=0.1,
+                )
+            ],
+        }
+    )
+
+    assert classifier.detect_protocol_triggers(voice_request, rules) == [
+        Trigger.VOICE_AMBIGUITY
+    ]
+    assert classifier.detect_protocol_triggers(canvas_request, rules) == [
+        Trigger.HANDWRITING_AMBIGUITY
+    ]
 
 
 def test_ai_engine_classify_returns_valid_tutor_response() -> None:
@@ -629,12 +1166,15 @@ def test_openai_request_uses_prompt_cache_key_only_when_enabled(monkeypatch) -> 
         model="gpt-test",
         timeout_seconds=1,
         prompt_cache_key_enabled=False,
+        store_responses=False,
         retry_count=0,
     )
     disabled_client.generate_tutor_turn(
         question="Solve for x: x + 4 = 9",
-        correct_answer="x = 5",
-        answer_spec=None,
+            correct_answer="x = 5",
+            answer_spec=None,
+            phase_2_prompt_context=None,
+            active_triggers=[],
         student_input="x = 13",
         phase="GUIDED_PRACTICE",
         input_source="TEXT",
@@ -656,12 +1196,15 @@ def test_openai_request_uses_prompt_cache_key_only_when_enabled(monkeypatch) -> 
         model="gpt-test",
         timeout_seconds=1,
         prompt_cache_key_enabled=True,
+        store_responses=True,
         retry_count=0,
     )
     enabled_client.generate_tutor_turn(
         question="Solve for x: x + 4 = 9",
-        correct_answer="x = 5",
-        answer_spec=None,
+            correct_answer="x = 5",
+            answer_spec=None,
+            phase_2_prompt_context=None,
+            active_triggers=[],
         student_input="x = 13",
         phase="GUIDED_PRACTICE",
         input_source="TEXT",
@@ -684,8 +1227,10 @@ def test_openai_request_uses_prompt_cache_key_only_when_enabled(monkeypatch) -> 
     )
 
     assert "prompt_cache_key" not in request_bodies[0]
+    assert request_bodies[0]["store"] is False
     assert len(request_bodies[1]["prompt_cache_key"]) == 64
     assert request_bodies[1]["prompt_cache_key"].isalnum()
+    assert request_bodies[1]["store"] is True
     assert "cache_control" not in json.dumps(request_bodies[1])
     assert request_bodies[1]["input"][3] == {
         "role": "assistant",
@@ -829,6 +1374,83 @@ def test_follow_up_reasoning_completes_previously_confirmed_answer() -> None:
     assert response.question_completed is True
     assert response.attempt_increment == 0
     assert response.tutor_message == "Thanks for explaining your method. Let us continue."
+
+
+@pytest.mark.parametrize(
+    ("attempt_count", "expected_strategy", "expected_hint_level"),
+    [
+        (1, "GUIDED_HINT", 1),
+        (2, "GUIDED_HINT", 2),
+        (3, "SCAFFOLD", None),
+        (4, "PROVIDE_WORKED_EXAMPLE", None),
+    ],
+)
+def test_repeated_confusion_progresses_guided_support(
+    attempt_count: int,
+    expected_strategy: str,
+    expected_hint_level: int | None,
+) -> None:
+    response = classify_student_response(
+        ClassificationRequest(
+            question="Write p × p × q in compact algebraic notation.",
+            correct_answer="p²q",
+            student_input="I don't know",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=attempt_count,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.intent == "EXPRESSING_CONFUSION"
+    assert response.evaluation == "NO_ATTEMPT"
+    assert response.response_strategy == expected_strategy
+    assert response.hint_level == expected_hint_level
+    assert response.attempt_increment == 0
+
+
+def test_explicit_confusion_intent_cannot_be_overridden_by_openai(
+    monkeypatch,
+) -> None:
+    class _ContradictingOpenAIClient:
+        def generate_tutor_turn(self, **kwargs) -> openai_client.OpenAITutorTurn:
+            assert kwargs["grounded_intent"] == "EXPRESSING_CONFUSION"
+            return openai_client.OpenAITutorTurn(
+                intent="SUBMITTING_ANSWER",
+                evaluation="INCORRECT",
+                error_type="UNKNOWN_ERROR",
+                response_strategy="GUIDED_HINT",
+                hint_level=2,
+                tutor_message="Try another answer.",
+                tutor_message_voice_optimised="Try another answer.",
+                reasoning_complete=False,
+                confidence=0.85,
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _ContradictingOpenAIClient(),
+    )
+
+    response = classify_student_response(
+        ClassificationRequest(
+            question="Write ½ × x in compact notation.",
+            correct_answer="½x",
+            student_input="I am stuck",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=3,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.intent == "EXPRESSING_CONFUSION"
+    assert response.evaluation == "NO_ATTEMPT"
+    assert response.response_strategy == "SCAFFOLD"
+    assert response.attempt_increment == 0
 
 
 def test_valid_worked_steps_override_incorrect_openai_reasoning_flag(monkeypatch) -> None:
@@ -1639,5 +2261,1494 @@ def test_retrieved_canvas_feedback_is_guarded_before_return() -> None:
 
     guarded = apply_retrieved_content(result, rag, "x = 5")
 
-    assert guarded.tutor_message == "I cannot give the final answer, but I can help you with the next step."
-    assert guarded.tutor_message_voice == guarded.tutor_message
+    assert guarded.tutor_message == result.tutor_message
+    assert guarded.tutor_message_voice == result.tutor_message_voice
+
+
+def test_canvas_wording_retries_an_answer_revealing_draft() -> None:
+    captured_feedback: list[str | None] = []
+
+    class _CanvasWordingClient:
+        def build_tutor_message(
+            self,
+            **kwargs: object,
+        ) -> openai_client.OpenAITutorMessage:
+            captured_feedback.append(
+                cast(str | None, kwargs["validation_feedback"])
+            )
+            if len(captured_feedback) == 1:
+                return openai_client.OpenAITutorMessage(
+                    tutor_message="The answer is x = 5.",
+                    tutor_message_voice_optimised="The answer is x equals 5.",
+                    confidence=0.95,
+                )
+            return openai_client.OpenAITutorMessage(
+                tutor_message="Which operation would undo adding four?",
+                tutor_message_voice_optimised="Which operation would undo adding four?",
+                confidence=0.95,
+            )
+
+    message = classifier.build_tutor_message_with_openai(
+        request=ClassificationRequest(
+            question_id="Q-CANVAS",
+            question="Solve x + 4 = 9.",
+            correct_answer="x = 5",
+            student_input="x = 6",
+            current_phase="GUIDED_PRACTICE",
+            input_source="CANVAS",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        ),
+        rules=classifier.load_classifier_rules(),
+        intent="SUBMITTING_ANSWER",
+        evaluation="INCORRECT",
+        error_type="ARITHMETIC_ERROR",
+        response_strategy="GUIDED_HINT",
+        hint_level=1,
+        canvas_context={"incorrect_step": "x = 6"},
+        openai_client=_CanvasWordingClient(),
+    )
+
+    assert message is not None
+    assert message.tutor_message == "Which operation would undo adding four?"
+    assert captured_feedback[0] is None
+    assert captured_feedback[1] is not None
+
+
+def test_guided_evaluator_retries_answer_revealing_wording(monkeypatch) -> None:
+    feedback: list[str | None] = []
+
+    class _GuidedClient:
+        def generate_guided_rubric(
+            self,
+            **kwargs: object,
+        ) -> GeneratedQuestionRubric:
+            return _guided_rubric()
+
+        def evaluate_guided_turn(
+            self,
+            **kwargs: object,
+        ) -> GuidedEvaluation:
+            feedback.append(cast(str | None, kwargs["validation_feedback"]))
+            message = (
+                "The answer is c multiplied by d."
+                if len(feedback) == 1
+                else "You identified multiplication. What do the two letters represent?"
+            )
+            return GuidedEvaluation(
+                student_state="PARTIAL",
+                newly_confirmed_concept_ids=["OPERATION"],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=["EXPANDED_MEANING"],
+                selected_error_code=None,
+                confidence=0.96,
+                next_objective=ActiveTeachingObjective(
+                    objective_type="EXPLAIN_CONCEPT",
+                    target_concept_ids=["EXPANDED_MEANING"],
+                    confirmed_concept_ids=["OPERATION"],
+                    missing_concept_ids=["EXPANDED_MEANING"],
+                ),
+                tutor_message=message,
+                tutor_message_voice=message,
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _GuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T02-002",
+            question="What does cd mean?",
+            correct_answer="c multiplied by d",
+            answer_spec=_answer_spec(
+                "c multiplied by d",
+                ["c times d"],
+                "CONCEPT_TEXT_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input="multiplication",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.guided_student_state == "PARTIAL"
+    assert response.tutor_message == (
+        "You identified multiplication. What do the two letters represent?"
+    )
+    assert feedback[0] is None
+    assert feedback[1] is not None
+
+
+def test_multipart_answer_numbers_do_not_trigger_numeric_reveal_guardrail() -> None:
+    rules = classifier.load_classifier_rules()
+    canonical_answer = "4 × n; p × q; r × r; c ÷ d; 2 × (x + 1)"
+
+    assert classifier.contains_answer_reveal(
+        "You identified r times r. What does the bracket represent?",
+        canonical_answer,
+        rules,
+    ) is False
+    assert classifier.contains_answer_reveal(
+        "The answer is 4 × n; p × q; r × r; c ÷ d; 2 × (x + 1).",
+        canonical_answer,
+        rules,
+    ) is True
+
+
+def test_single_numeric_answer_still_uses_numeric_reveal_guardrail() -> None:
+    rules = classifier.load_classifier_rules()
+
+    assert classifier.contains_answer_reveal(
+        "Subtracting gives five.",
+        "x = 5",
+        rules,
+    ) is False
+    assert classifier.contains_answer_reveal(
+        "Subtracting gives 5.",
+        "x = 5",
+        rules,
+    ) is True
+
+
+def test_guided_llm_partial_persists_only_the_missing_objective(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _GuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            captured["rubric"] = kwargs
+            return _guided_rubric()
+
+        def evaluate_guided_turn(self, **kwargs):
+            return GuidedEvaluation(
+                student_state="PARTIAL",
+                newly_confirmed_concept_ids=["OPERATION"],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=["CONCEPT_EXPLANATION_OF_OPERATION"],
+                selected_error_code=None,
+                confidence=0.96,
+                next_objective=ActiveTeachingObjective(
+                    objective_type="EXPLAIN_CONCEPT",
+                    target_concept_ids=["CONCEPT_EXPLANATION_OF_OPERATION"],
+                    confirmed_concept_ids=[],
+                    missing_concept_ids=["CONCEPT_EXPLANATION_OF_OPERATION"],
+                ),
+                tutor_message="Multiplication is the operation. What does cd expand to?",
+                tutor_message_voice="Multiplication is the operation. What does c d expand to?",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _GuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T02-002",
+            question="What does cd mean?",
+            correct_answer="c multiplied by d",
+            answer_spec=_answer_spec(
+                "c multiplied by d",
+                ["c times d"],
+                "CONCEPT_TEXT_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input="multiplication",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.guided_student_state == "PARTIAL"
+    assert response.student_model_events == []
+    assert response.attempt_increment == 0
+    assert response.active_teaching_objective is not None
+    assert response.active_teaching_objective.confirmed_concept_ids == ["OPERATION"]
+    assert response.active_teaching_objective.missing_concept_ids == ["EXPANDED_MEANING"]
+    rubric_payload = captured["rubric"]
+    assert isinstance(rubric_payload, dict)
+    assert rubric_payload["potential_errors"] == [
+        {
+            "error_code": "ERR-T02-ADDITION",
+            "description": "Interprets adjacent terms as addition.",
+            "response_patterns": ["c + d"],
+        }
+    ]
+
+
+def test_guided_partial_without_confirmed_concepts_becomes_safe_unclear(
+    monkeypatch,
+) -> None:
+    class _InconsistentGuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            return _guided_rubric()
+
+        def evaluate_guided_turn(self, **kwargs):
+            return GuidedEvaluation(
+                student_state="PARTIAL",
+                newly_confirmed_concept_ids=[],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=["OPERATION", "EXPANDED_MEANING"],
+                selected_error_code=None,
+                confidence=0.92,
+                next_objective=kwargs["active_objective"],
+                tutor_message="You have part of the idea.",
+                tutor_message_voice="You have part of the idea.",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _InconsistentGuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T02-002",
+            question="What does cd mean?",
+            correct_answer="c multiplied by d",
+            answer_spec=_answer_spec(
+                "c multiplied by d",
+                ["c times d"],
+                "CONCEPT_TEXT_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input="multiplication",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.guided_student_state == "UNCLEAR"
+    assert response.student_model_events == []
+    assert response.attempt_increment == 0
+    assert response.question_completed is False
+    assert response.tutor_message == (
+        "I want to make sure I understood that. "
+        "Please explain the part that is still unresolved."
+    )
+
+
+def test_guided_error_definitions_preserve_student_model_metadata() -> None:
+    definitions = classifier.guided_error_definitions(
+        [
+            {
+                "error_code": "ERR-T02-POWER-AS-COEFFICIENT",
+                "error_description": "Treats the exponent as a coefficient.",
+                "response_patterns": ["2pq", 123],
+            }
+        ]
+    )
+
+    assert definitions == [
+        {
+            "error_code": "ERR-T02-POWER-AS-COEFFICIENT",
+            "description": "Treats the exponent as a coefficient.",
+            "response_patterns": ["2pq"],
+        }
+    ]
+
+
+def test_guided_multipart_canonical_answer_cannot_be_downgraded_by_llm(
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    class _PartialGuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            return _multipart_guided_rubric()
+
+        def evaluate_guided_turn(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            return GuidedEvaluation(
+                student_state="PARTIAL",
+                newly_confirmed_concept_ids=["GENERAL_RULE"],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=["CHANGING_VALUE", "FIXED_INCREMENT"],
+                selected_error_code=None,
+                confidence=0.98,
+                next_objective=kwargs["active_objective"],
+                tutor_message="What else changes?",
+                tutor_message_voice="What else changes?",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _PartialGuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T01-006",
+            question=(
+                "A counter starts at any value c and increases by 4. "
+                "Write the general rule and state what changes and what stays fixed."
+            ),
+            question_type="MULTI_PART_SHORT_RESPONSE",
+            correct_answer="c + 4; c changes; +4 stays fixed",
+            answer_spec=_answer_spec(
+                "c + 4; c changes; +4 stays fixed",
+                ["c+4", "c is changing", "add 4 stays fixed"],
+                "STRUCTURED_TEXT_AND_SYMBOLIC_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input="c + 4; c changes; +4 stays fixed",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert calls == 1
+    assert response.evaluation == "CORRECT"
+    assert response.guided_student_state == "CORRECT"
+    assert response.question_completed is True
+    assert response.attempt_increment == 1
+    assert response.active_teaching_objective is None
+    assert response.recommended_conversation_action == "ADVANCE_TO_NEXT_QUESTION"
+
+
+def test_guided_multipart_undetermined_paraphrase_still_uses_llm(monkeypatch) -> None:
+    calls = 0
+
+    class _SemanticGuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            return _multipart_guided_rubric()
+
+        def evaluate_guided_turn(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            assert kwargs["deterministic_evaluation"] is None
+            return GuidedEvaluation(
+                student_state="CORRECT",
+                newly_confirmed_concept_ids=[
+                    "GENERAL_RULE",
+                    "CHANGING_VALUE",
+                    "FIXED_INCREMENT",
+                ],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=[],
+                selected_error_code=None,
+                confidence=0.98,
+                next_objective=None,
+                tutor_message="Yes, that describes the complete rule.",
+                tutor_message_voice="Yes, that describes the complete rule.",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _SemanticGuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T01-006",
+            question=(
+                "A counter starts at any value c and increases by 4. "
+                "Write the general rule and state what changes and what stays fixed."
+            ),
+            question_type="MULTI_PART_SHORT_RESPONSE",
+            correct_answer="c + 4; c changes; +4 stays fixed",
+            answer_spec=_answer_spec(
+                "c + 4; c changes; +4 stays fixed",
+                ["c+4", "c is changing", "add 4 stays fixed"],
+                "STRUCTURED_TEXT_AND_SYMBOLIC_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input=(
+                "The counter can start at different values, and every time "
+                "you add four to it."
+            ),
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert calls == 1
+    assert response.evaluation == "CORRECT"
+    assert response.question_completed is True
+
+
+def test_non_multipart_deterministic_correct_stays_outside_guided_llm(
+    monkeypatch,
+) -> None:
+    class _UnexpectedGuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            raise AssertionError("Non-multipart deterministic answers must not use the guided LLM.")
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _UnexpectedGuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T02-002",
+            question="What does cd mean?",
+            correct_answer="c multiplied by d",
+            answer_spec=_answer_spec(
+                "c multiplied by d",
+                ["c times d"],
+                "CONCEPT_TEXT_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input="c times d",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.evaluation == "CORRECT"
+    assert response.question_completed is True
+
+
+def test_guided_multipart_preserves_completed_parts_and_requests_the_missing_part(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+    rubric = GeneratedQuestionRubric(
+        question_id="Q-T01-006",
+        required_concepts=[
+            GeneratedConcept(
+                concept_id="GENERAL_RULE",
+                description="States the general rule c + 4.",
+                required=True,
+            ),
+            GeneratedConcept(
+                concept_id="CHANGING_VALUE",
+                description="Identifies c as changing.",
+                required=True,
+            ),
+            GeneratedConcept(
+                concept_id="FIXED_INCREMENT",
+                description="Identifies +4 as fixed.",
+                required=True,
+            ),
+        ],
+        completion_rule="ALL_REQUIRED_CONCEPTS",
+        cache_key="multipart-rubric",
+        prompt_version="1.0.0",
+    )
+
+    class _GuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            captured["rubric_question_type"] = kwargs["question_type"]
+            return rubric
+
+        def evaluate_guided_turn(self, **kwargs):
+            captured["evaluation_question_type"] = kwargs["question_type"]
+            return GuidedEvaluation(
+                student_state="PARTIAL",
+                newly_confirmed_concept_ids=["GENERAL_RULE", "CHANGING_VALUE"],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=["FIXED_INCREMENT"],
+                selected_error_code=None,
+                confidence=0.98,
+                next_objective=ActiveTeachingObjective(
+                    objective_type="EXPLAIN_CONCEPT",
+                    target_concept_ids=["FIXED_INCREMENT"],
+                    confirmed_concept_ids=[],
+                    missing_concept_ids=["FIXED_INCREMENT"],
+                ),
+                tutor_message="Your rule and changing value are clear. What stays fixed?",
+                tutor_message_voice="Your rule and changing value are clear. What stays fixed?",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _GuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T01-006",
+            question=(
+                "A counter starts at any value c and increases by 4. "
+                "Write the general rule and state what changes and what stays fixed."
+            ),
+            question_type="MULTI_PART_SHORT_RESPONSE",
+            correct_answer="c + 4; c changes; +4 stays fixed",
+            answer_spec=_answer_spec(
+                "c + 4; c changes; +4 stays fixed",
+                ["c+4", "c is changing", "add 4 stays fixed"],
+                "STRUCTURED_TEXT_AND_SYMBOLIC_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input="The rule is c + 4 and c changes.",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert captured == {
+        "rubric_question_type": "MULTI_PART_SHORT_RESPONSE",
+        "evaluation_question_type": "MULTI_PART_SHORT_RESPONSE",
+    }
+    assert response.guided_student_state == "PARTIAL"
+    assert response.student_model_events == []
+    assert response.active_teaching_objective is not None
+    assert response.active_teaching_objective.confirmed_concept_ids == [
+        "CHANGING_VALUE",
+        "GENERAL_RULE",
+    ]
+    assert response.active_teaching_objective.missing_concept_ids == [
+        "FIXED_INCREMENT"
+    ]
+
+
+def test_guided_multipart_reconciles_completion_with_unconfirmed_required_parts(
+    monkeypatch,
+) -> None:
+    rubric = GeneratedQuestionRubric(
+        question_id="Q-T01-006",
+        required_concepts=[
+            GeneratedConcept(
+                concept_id="GENERAL_RULE",
+                description="States the general rule c + 4.",
+                required=True,
+            ),
+            GeneratedConcept(
+                concept_id="CHANGING_VALUE",
+                description="Identifies c as changing.",
+                required=True,
+            ),
+            GeneratedConcept(
+                concept_id="FIXED_INCREMENT",
+                description="Identifies +4 as fixed.",
+                required=True,
+            ),
+        ],
+        completion_rule="ALL_REQUIRED_CONCEPTS",
+        cache_key="multipart-rubric",
+        prompt_version="1.0.0",
+    )
+
+    class _InvalidGuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            return rubric
+
+        def evaluate_guided_turn(self, **kwargs):
+            return GuidedEvaluation(
+                student_state="CORRECT",
+                newly_confirmed_concept_ids=["GENERAL_RULE"],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=[],
+                selected_error_code=None,
+                confidence=0.98,
+                next_objective=None,
+                tutor_message="That completes the question.",
+                tutor_message_voice="That completes the question.",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _InvalidGuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T01-006",
+            question=(
+                "A counter starts at any value c and increases by 4. "
+                "Write the general rule and state what changes and what stays fixed."
+            ),
+            question_type="MULTI_PART_SHORT_RESPONSE",
+            correct_answer="c + 4; c changes; +4 stays fixed",
+            answer_spec=_answer_spec(
+                "c + 4; c changes; +4 stays fixed",
+                ["c+4", "c is changing", "add 4 stays fixed"],
+                "STRUCTURED_TEXT_AND_SYMBOLIC_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input="c + 4",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.guided_student_state == "UNCLEAR"
+    assert response.student_model_events == []
+    assert response.attempt_increment == 0
+    assert response.question_completed is False
+    assert response.active_teaching_objective is not None
+    assert response.active_teaching_objective.confirmed_concept_ids == []
+    assert response.active_teaching_objective.missing_concept_ids == [
+        "CHANGING_VALUE",
+        "FIXED_INCREMENT",
+        "GENERAL_RULE",
+    ]
+
+
+@pytest.mark.parametrize(
+    (
+        "question_type",
+        "question",
+        "canonical_answer",
+        "verification_method",
+        "student_input",
+    ),
+    [
+        (
+            "CHOICE_WITH_EXPLANATION",
+            "Which statement is correct? Select one and explain why.",
+            "B",
+            "EXACT_CHOICE_MATCH",
+            "B",
+        ),
+        (
+            "TRUE_FALSE_WITH_EXPLANATION",
+            "True or false: In 4x, 4 is added to x. Explain.",
+            "false",
+            "BOOLEAN_AND_CONCEPT_MATCH",
+            "false",
+        ),
+    ],
+)
+def test_explanation_question_does_not_complete_from_the_answer_alone(
+    monkeypatch,
+    question_type,
+    question,
+    canonical_answer,
+    verification_method,
+    student_input,
+) -> None:
+    captured: dict[str, object] = {}
+    rubric = GeneratedQuestionRubric(
+        question_id="Q-EXPLANATION",
+        required_concepts=[
+            GeneratedConcept(
+                concept_id="ANSWER",
+                description="Selects the correct answer.",
+                required=True,
+            ),
+            GeneratedConcept(
+                concept_id="EXPLANATION",
+                description="Explains the mathematical reason.",
+                required=True,
+            ),
+        ],
+        completion_rule="ALL_REQUIRED_CONCEPTS",
+        cache_key="explanation-rubric",
+        prompt_version="1.1.0",
+    )
+
+    class _GuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            captured["rubric_question_type"] = kwargs["question_type"]
+            return rubric
+
+        def evaluate_guided_turn(self, **kwargs):
+            captured["evaluation_question_type"] = kwargs["question_type"]
+            return GuidedEvaluation(
+                student_state="PARTIAL",
+                newly_confirmed_concept_ids=["ANSWER"],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=["EXPLANATION"],
+                selected_error_code=None,
+                confidence=0.98,
+                next_objective=ActiveTeachingObjective(
+                    objective_type="EXPLAIN_REASONING",
+                    target_concept_ids=["EXPLANATION"],
+                    confirmed_concept_ids=[],
+                    missing_concept_ids=["EXPLANATION"],
+                ),
+                tutor_message="That answer is selected. What mathematical reason supports it?",
+                tutor_message_voice="That answer is selected. What mathematical reason supports it?",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _GuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-EXPLANATION",
+            question_type=question_type,
+            question=question,
+            correct_answer=canonical_answer,
+            answer_spec=AnswerSpec(
+                answer_spec_id="ANS-EXPLANATION",
+                canonical_answer=canonical_answer,
+                accepted_answers=[canonical_answer],
+                verification_method=verification_method,
+                explanation_required=True,
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input=student_input,
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert captured == {
+        "rubric_question_type": question_type,
+        "evaluation_question_type": question_type,
+    }
+    assert response.guided_student_state == "PARTIAL"
+    assert response.question_completed is False
+    assert response.student_model_events == []
+    assert response.active_teaching_objective is not None
+    assert response.active_teaching_objective.confirmed_concept_ids == ["ANSWER"]
+    assert response.active_teaching_objective.missing_concept_ids == ["EXPLANATION"]
+
+
+def test_explanation_question_rejects_a_single_component_rubric(
+    monkeypatch,
+) -> None:
+    class _InvalidGuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            return GeneratedQuestionRubric(
+                question_id="Q-EXPLANATION",
+                required_concepts=[
+                    GeneratedConcept(
+                        concept_id="ANSWER",
+                        description="Selects the correct answer.",
+                        required=True,
+                    )
+                ],
+                completion_rule="ALL_REQUIRED_CONCEPTS",
+                cache_key="invalid-explanation-rubric",
+                prompt_version="1.1.0",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _InvalidGuidedClient(),
+    )
+    with pytest.raises(
+        AdapterError,
+        match="separate required concepts for every answer component",
+    ):
+        classify_student_response(
+            ClassificationRequest(
+                question_id="Q-EXPLANATION",
+                question_type="CHOICE_WITH_EXPLANATION",
+                question="Which statement is correct? Select one and explain why.",
+                correct_answer="B",
+                answer_spec=AnswerSpec(
+                    answer_spec_id="ANS-EXPLANATION",
+                    canonical_answer="B",
+                    accepted_answers=["B"],
+                    verification_method="EXACT_CHOICE_MATCH",
+                    explanation_required=True,
+                ),
+                phase_2_prompt_context=_guided_context(0),
+                student_input="B",
+                current_phase="GUIDED_PRACTICE",
+                input_source="TEXT",
+                transcript_confidence=None,
+                attempt_count=1,
+                current_hint_level=None,
+            )
+        )
+
+
+def test_guided_llm_repeated_stuck_requests_one_scaffold_escalation(
+    monkeypatch,
+) -> None:
+    class _GuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            return _guided_rubric()
+
+        def evaluate_guided_turn(self, **kwargs):
+            objective = kwargs["active_objective"]
+            return GuidedEvaluation(
+                student_state="STUCK",
+                newly_confirmed_concept_ids=[],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=objective.missing_concept_ids,
+                selected_error_code=None,
+                confidence=0.94,
+                next_objective=objective,
+                tutor_message="Let’s make it smaller. What operation joins c and d?",
+                tutor_message_voice="Let’s make it smaller. What operation joins c and d?",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _GuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T02-002",
+            question="What does cd mean?",
+            correct_answer="c multiplied by d",
+            answer_spec=_answer_spec(
+                "c multiplied by d",
+                ["c times d"],
+                "CONCEPT_TEXT_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(1),
+            student_input="I don't know",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.guided_student_state == "STUCK"
+    assert response.response_strategy == "SCAFFOLD"
+    assert response.student_model_events == []
+    assert response.attempt_increment == 0
+
+
+def test_guided_wrong_at_configured_confidence_requests_student_model_support(
+    monkeypatch,
+) -> None:
+    class _GuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            return _guided_rubric().model_copy(
+                update={"question_id": "Q-T02-003"}
+            )
+
+        def evaluate_guided_turn(self, **kwargs):
+            assert kwargs["deterministic_evaluation"] == "INCORRECT"
+            return GuidedEvaluation(
+                student_state="WRONG",
+                newly_confirmed_concept_ids=[],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=[],
+                selected_error_code="ERR-T02-ADDITION",
+                confidence=0.5,
+                next_objective=kwargs["active_objective"],
+                tutor_message="That interpretation uses addition. What operation does cd represent?",
+                tutor_message_voice="That interpretation uses addition. What operation does c d represent?",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _GuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T02-003",
+            question="Write p × p × q in compact algebraic notation.",
+            correct_answer="p²q",
+            answer_spec=_answer_spec(
+                "p²q",
+                ["p^2q"],
+                "EXACT_NOTATION_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input="p^q",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.guided_student_state == "WRONG"
+    assert response.selected_error_code == "ERR-T02-ADDITION"
+    assert response.attempt_increment == 1
+
+
+def test_guided_explicit_stuck_is_not_downgraded_by_semantic_confidence(
+    monkeypatch,
+) -> None:
+    class _GuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            return _guided_rubric()
+
+        def evaluate_guided_turn(self, **kwargs):
+            objective = kwargs["active_objective"]
+            return GuidedEvaluation(
+                student_state="STUCK",
+                newly_confirmed_concept_ids=[],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=objective.missing_concept_ids,
+                selected_error_code=None,
+                confidence=0.0,
+                next_objective=objective,
+                tutor_message="Let’s make it smaller. What operation joins c and d?",
+                tutor_message_voice="Let’s make it smaller. What operation joins c and d?",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _GuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T02-002",
+            question="What does cd mean?",
+            correct_answer="c multiplied by d",
+            answer_spec=_answer_spec(
+                "c multiplied by d",
+                ["c times d"],
+                "CONCEPT_TEXT_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(1),
+            student_input="I don't know",
+            current_phase="GUIDED_PRACTICE",
+            input_source="VOICE",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.guided_student_state == "STUCK"
+    assert response.response_strategy == "SCAFFOLD"
+    assert response.attempt_increment == 0
+
+
+def test_guided_correct_keeps_the_strict_confidence_threshold(
+    monkeypatch,
+) -> None:
+    class _GuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            return _guided_rubric()
+
+        def evaluate_guided_turn(self, **kwargs):
+            return GuidedEvaluation(
+                student_state="CORRECT",
+                newly_confirmed_concept_ids=["OPERATION", "EXPANDED_MEANING"],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=[],
+                selected_error_code=None,
+                confidence=0.7,
+                next_objective=None,
+                tutor_message="That explains the meaning.",
+                tutor_message_voice="That explains the meaning.",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _GuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T02-002",
+            question="What does cd mean?",
+            correct_answer="c multiplied by d",
+            answer_spec=_answer_spec(
+                "c multiplied by d",
+                ["c times d"],
+                "CONCEPT_TEXT_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input="It indicates multiplication.",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.guided_student_state == "UNCLEAR"
+    assert response.attempt_increment == 0
+    assert response.question_completed is False
+
+
+def test_guided_exact_notation_stuck_uses_question_aware_llm_message(
+    monkeypatch,
+) -> None:
+    class _GuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            return _guided_rubric().model_copy(
+                update={"question_id": "Q-T02-001"}
+            )
+
+        def evaluate_guided_turn(self, **kwargs):
+            objective = kwargs["active_objective"]
+            return GuidedEvaluation(
+                student_state="STUCK",
+                newly_confirmed_concept_ids=[],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=objective.missing_concept_ids,
+                selected_error_code=None,
+                confidence=0.95,
+                next_objective=objective,
+                tutor_message="Let’s make it smaller. Which letter is repeated?",
+                tutor_message_voice="Let’s make it smaller. Which letter is repeated?",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _GuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T02-001",
+            question="Write y + y + y + y in compact algebraic notation.",
+            correct_answer="4y",
+            answer_spec=_answer_spec(
+                "4y",
+                ["4 × y"],
+                "EXACT_NOTATION_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input="I don't know",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.guided_student_state == "STUCK"
+    assert response.tutor_message == (
+        "Let’s make it smaller. Which letter is repeated?"
+    )
+    assert "x" not in response.tutor_message
+    assert response.attempt_increment == 0
+
+
+def test_guided_llm_wrong_uses_only_a_permitted_error_code(monkeypatch) -> None:
+    class _GuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            return _guided_rubric()
+
+        def evaluate_guided_turn(self, **kwargs):
+            return GuidedEvaluation(
+                student_state="WRONG",
+                newly_confirmed_concept_ids=[],
+                preserved_concept_ids=[],
+                contradicted_concept_ids=[],
+                missing_concept_ids=["OPERATION", "EXPANDED_MEANING"],
+                selected_error_code="ERR-T02-ADDITION",
+                confidence=0.97,
+                next_objective=ActiveTeachingObjective(
+                    objective_type="RECONSIDER_CONCEPT",
+                    target_concept_ids=["OPERATION"],
+                    confirmed_concept_ids=[],
+                    missing_concept_ids=["OPERATION", "EXPANDED_MEANING"],
+                ),
+                tutor_message="Test that idea: does writing letters together mean adding?",
+                tutor_message_voice="Test that idea: does writing letters together mean adding?",
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _GuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T02-002",
+            question="What does cd mean?",
+            correct_answer="c multiplied by d",
+            answer_spec=_answer_spec(
+                "c multiplied by d",
+                ["c times d"],
+                "CONCEPT_TEXT_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input="c plus d",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.guided_student_state == "WRONG"
+    assert response.selected_error_code == "ERR-T02-ADDITION"
+    assert response.attempt_increment == 1
+
+
+@pytest.mark.parametrize(
+    "student_input",
+    ["c x d", "c × d", "c*d", "c · d", "c times d", "c multiplied by d"],
+)
+def test_guided_concept_notation_equivalents_cannot_be_rejected_by_llm(
+    monkeypatch,
+    student_input: str,
+) -> None:
+    class _RejectingGuidedClient:
+        def generate_guided_rubric(self, **kwargs):
+            raise AssertionError("An exact normalized match must not call the LLM.")
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _RejectingGuidedClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T02-002",
+            question="What does cd mean?",
+            correct_answer="c multiplied by d",
+            answer_spec=_answer_spec(
+                "c multiplied by d",
+                ["c times d", "c × d"],
+                "CONCEPT_TEXT_MATCH",
+            ),
+            phase_2_prompt_context=_guided_context(0),
+            student_input=student_input,
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.evaluation == "CORRECT"
+    assert response.question_completed is True
+
+
+@pytest.mark.parametrize(
+    ("student_input", "canonical_answer"),
+    [
+        ("p − 2", "p - 2"),
+        ("6 / r", "6 ÷ r"),
+        ("n equals 4", "n = 4"),
+        ("6 * r", "6 × r"),
+    ],
+)
+def test_semantic_contract_normalizes_general_keyboard_math_notation(
+    student_input: str,
+    canonical_answer: str,
+) -> None:
+    request = ClassificationRequest(
+        question="Interpret the expression.",
+        correct_answer=canonical_answer,
+        answer_spec=_answer_spec(
+            canonical_answer,
+            [],
+            "CONCEPT_TEXT_MATCH",
+        ),
+        student_input=student_input,
+        current_phase="GUIDED_PRACTICE",
+        input_source="TEXT",
+        transcript_confidence=None,
+        attempt_count=1,
+        current_hint_level=None,
+    )
+
+    assert classifier.evaluate_answer_contract(request) == "CORRECT"
+
+
+def test_multi_part_accepted_fragment_is_not_treated_as_complete(
+    monkeypatch,
+) -> None:
+    class _PartialOpenAIClient:
+        def generate_tutor_turn(self, **kwargs):
+            return openai_client.OpenAITutorTurn(
+                intent="SUBMITTING_ANSWER",
+                evaluation="PARTIALLY_CORRECT",
+                error_type="INSUFFICIENT_INFORMATION",
+                response_strategy="GUIDED_HINT",
+                hint_level=1,
+                tutor_message="Yes, b can vary. What stays fixed?",
+                tutor_message_voice_optimised="Yes, b can vary. What stays fixed?",
+                reasoning_complete=False,
+                confidence=0.96,
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _PartialOpenAIClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question="What changes and what stays fixed?",
+            correct_answer="b can vary; 3 stays fixed",
+            answer_spec=_answer_spec(
+                "b can vary; 3 stays fixed",
+                ["b can vary", "3 stays fixed"],
+                "CONCEPT_TEXT_MATCH",
+            ),
+            student_input="b can vary",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=1,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.evaluation == "PARTIALLY_CORRECT"
+    assert response.question_completed is False
+
+
+def test_guided_rubric_uses_only_the_compact_specialized_prompt(
+    monkeypatch,
+) -> None:
+    request_bodies: list[dict[str, object]] = []
+
+    class _GuidedHTTPClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "_GuidedHTTPClient":
+            return self
+
+        def __exit__(self, *exc) -> bool:
+            return False
+
+        def post(self, *args, **kwargs) -> _FakeOpenAIResponse:
+            request_bodies.append(kwargs["json"])
+            return _FakeOpenAIResponse(
+                json.dumps(
+                    {
+                        "question_id": "Q-T02-002",
+                        "required_concepts": [
+                            {
+                                "concept_id": "PRODUCT_MEANING",
+                                "description": "Explains adjacent-letter multiplication.",
+                                "required": True,
+                            }
+                        ],
+                        "completion_rule": "ALL_REQUIRED_CONCEPTS",
+                        "cache_key": "model-value-is-replaced",
+                        "prompt_version": "model-value-is-replaced",
+                    }
+                )
+            )
+
+    monkeypatch.setattr(openai_client.httpx, "Client", _GuidedHTTPClient)
+    ai_client = openai_client.OpenAIAIEngineClient(
+        api_key="sk-test",
+        model="gpt-test",
+        timeout_seconds=10,
+        prompt_cache_key_enabled=False,
+        store_responses=False,
+        retry_count=0,
+    )
+    system_prompt = "Compact rubric prompt."
+    ai_client.generate_guided_rubric(
+        question_id="Q-T02-002",
+        question_type="SHORT_RESPONSE",
+        question="What does cd mean?",
+        answer_spec=_answer_spec(
+            "c × d",
+            ["c times d"],
+            "CONCEPT_TEXT_MATCH",
+        ),
+        potential_errors=[],
+        target_micro_skill_ids=["T02.M2"],
+        prompt_version="1.0.0",
+        system_prompt=system_prompt,
+    )
+
+    assert len(request_bodies) == 1
+    messages = request_bodies[0]["input"]
+    assert isinstance(messages, list)
+    assert messages == [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": messages[1]["content"],
+        },
+    ]
+    assert "You are Numera" not in str(messages)
+
+
+def test_guided_learning_supports_every_authored_answer_verification_method() -> None:
+    rules = classifier.load_classifier_rules()
+
+    assert set(rules.guided_learning.supported_verification_methods) == {
+        "EXACT_CHOICE_MATCH",
+        "EXACT_NOTATION_MATCH",
+        "SYMBOLIC_EQUIVALENCE",
+        "CONCEPT_TEXT_MATCH",
+        "STRUCTURED_TEXT_MATCH",
+        "STRUCTURED_TEXT_AND_SYMBOLIC_MATCH",
+        "CHOICE_AND_CONCEPT_MATCH",
+        "BOOLEAN_AND_CONCEPT_MATCH",
+    }
+
+
+def test_guided_learning_rejects_an_unknown_verification_contract(
+    monkeypatch,
+) -> None:
+    class _UnusedGuidedClient:
+        pass
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _UnusedGuidedClient(),
+    )
+
+    with pytest.raises(
+        AdapterError,
+        match="Unsupported Guided Learning verification method",
+    ):
+        classify_student_response(
+            ClassificationRequest(
+                question_id="Q-UNKNOWN",
+                question="Explain this.",
+                correct_answer="An answer.",
+                answer_spec=_answer_spec(
+                    "An answer.",
+                    [],
+                    "UNKNOWN_FUTURE_METHOD",
+                ),
+                phase_2_prompt_context=_guided_context(0),
+                student_input="A response.",
+                current_phase="GUIDED_PRACTICE",
+                input_source="TEXT",
+                transcript_confidence=None,
+                attempt_count=1,
+                current_hint_level=None,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("student_input", "original_answer_correct"),
+    [
+        ("y", False),
+        ("y is repeated four times, so the answer is 4y", True),
+    ],
+)
+def test_scaffold_semantic_evaluator_accepts_the_requested_fact_or_full_answer(
+    monkeypatch,
+    student_input: str,
+    original_answer_correct: bool,
+) -> None:
+    class _ScaffoldClient:
+        def evaluate_scaffold_step(self, **kwargs):
+            return ScaffoldStepEvaluation(
+                step_satisfied=True,
+                original_answer_correct=original_answer_correct,
+                demonstrated_fact="The repeated term is y.",
+                confidence=0.97,
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _ScaffoldClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T02-001",
+            question="Which term or factor is repeated?",
+            correct_answer="Identify the repeated letter or base",
+            answer_spec=None,
+            phase_2_prompt_context=_guided_context(0),
+            scaffold_evaluation_context=ScaffoldEvaluationContext(
+                scaffold_id="SCF-T02-WRITE-COMPACT",
+                step_id="SCF-T02-WR-S1",
+                original_question=(
+                    "Write y + y + y + y in compact algebraic notation."
+                ),
+                canonical_answer="4y",
+                accepted_answers=["4y", "4 × y"],
+                verification_method="EXACT_NOTATION_MATCH",
+                step_prompt="Which term or factor is repeated?",
+                expected_response_criterion="Identify the repeated letter or base",
+                completed_step_ids=[],
+            ),
+            student_input=student_input,
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=2,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.evaluation == "CORRECT"
+    assert response.scaffold_original_answer_correct is original_answer_correct
+
+
+def test_scaffold_semantic_evaluator_rejects_an_unrelated_response(
+    monkeypatch,
+) -> None:
+    class _ScaffoldClient:
+        def evaluate_scaffold_step(self, **kwargs):
+            return ScaffoldStepEvaluation(
+                step_satisfied=False,
+                original_answer_correct=False,
+                demonstrated_fact=None,
+                confidence=0.96,
+            )
+
+    monkeypatch.setattr(
+        classifier,
+        "build_openai_ai_engine_client",
+        lambda settings: _ScaffoldClient(),
+    )
+    response = classify_student_response(
+        ClassificationRequest(
+            question_id="Q-T02-001",
+            question="Which term or factor is repeated?",
+            correct_answer="Identify the repeated letter or base",
+            answer_spec=None,
+            phase_2_prompt_context=_guided_context(0),
+            scaffold_evaluation_context=ScaffoldEvaluationContext(
+                scaffold_id="SCF-T02-WRITE-COMPACT",
+                step_id="SCF-T02-WR-S1",
+                original_question=(
+                    "Write y + y + y + y in compact algebraic notation."
+                ),
+                canonical_answer="4y",
+                accepted_answers=["4y", "4 × y"],
+                verification_method="EXACT_NOTATION_MATCH",
+                step_prompt="Which term or factor is repeated?",
+                expected_response_criterion="Identify the repeated letter or base",
+                completed_step_ids=[],
+            ),
+            student_input="the operation is subtraction",
+            current_phase="GUIDED_PRACTICE",
+            input_source="TEXT",
+            transcript_confidence=None,
+            attempt_count=2,
+            current_hint_level=None,
+        )
+    )
+
+    assert response.evaluation == "INCORRECT"
+    assert response.scaffold_original_answer_correct is False

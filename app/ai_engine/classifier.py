@@ -10,6 +10,7 @@ from pydantic import Field
 
 from app.ai_engine.canvas_math_review import review_canvas_math
 from app.ai_engine.classifier_config import ClassifierRulesConfig, load_classifier_rules
+from app.ai_engine.prompt_registry import Trigger
 from app.ai_engine.schemas import (
     CanvasAnnotationIntent,
     CanvasFeedback,
@@ -18,6 +19,8 @@ from app.ai_engine.schemas import (
     CanvasTextRegion,
     ErrorType,
     EvaluationCategory,
+    ExplainAgainRequest,
+    ExplainAgainResult,
     GuardrailCheck,
     HintLevel,
     InputSource,
@@ -34,8 +37,21 @@ from app.ai_engine.schemas import (
 from app.core.config import Settings, get_settings
 from app.core.exceptions import AdapterError
 from app.core.logger import logger
-from app.models.adapters import ConversationAction, ConversationMessage, ConversationState
-from app.models.student_model_session import AnswerSpec
+from app.models.adapters import (
+    ConversationAction,
+    ConversationMessage,
+    ConversationState,
+    Phase2PromptContext,
+)
+from app.models.guided_learning import (
+    ActiveTeachingObjective,
+    GeneratedQuestionRubric,
+    GuidedEvaluation,
+    GuidedStudentState,
+    ScaffoldEvaluationContext,
+    ScaffoldStepEvaluation,
+)
+from app.models.student_model_session import AnswerSpec, QuestionType
 
 if TYPE_CHECKING:
     from app.ai_engine.openai_client import (
@@ -46,9 +62,12 @@ if TYPE_CHECKING:
 
 
 class ClassificationRequest(StrictSchema):
+    question_id: str | None = None
+    question_type: QuestionType | None = None
     question: str
     correct_answer: str
     answer_spec: AnswerSpec | None = None
+    phase_2_prompt_context: Phase2PromptContext | None = None
     student_input: str
     current_phase: LearningPhase
     input_source: InputSource
@@ -65,6 +84,9 @@ class ClassificationRequest(StrictSchema):
     canvas_regions: list[CanvasTextRegion] = Field(default_factory=list)
     conversation_history: list[ConversationMessage] = Field(default_factory=list)
     conversation_state: ConversationState | None = None
+    generated_question_rubric: GeneratedQuestionRubric | None = None
+    active_teaching_objective: ActiveTeachingObjective | None = None
+    scaffold_evaluation_context: ScaffoldEvaluationContext | None = None
 
 
 @dataclass(frozen=True)
@@ -113,8 +135,49 @@ def classify_student_response(request: ClassificationRequest) -> TutorResponse:
             safety_check=safety_check,
         )
 
+    if (
+        request.scaffold_evaluation_context is not None
+        and not (
+            request.input_source == "VOICE"
+            and is_low_confidence(request.transcript_confidence, rules)
+        )
+        and openai_client is not None
+    ):
+        return classify_scaffold_response(
+            request,
+            rules,
+            safety_check,
+            openai_client,
+        )
+
     evaluation: EvaluationCategory | None = evaluate_answer_attempt(request, intent, rules)
-    authoritative_verification = uses_authoritative_verification(request)
+    if (
+        request.current_phase == "GUIDED_PRACTICE"
+        and request.phase_2_prompt_context is not None
+        and rules.guided_learning.evaluation_mode == "LLM_STATE_MACHINE"
+        and settings.use_openai_ai_engine
+        and openai_client is None
+    ):
+        raise AdapterError(
+            "openai_ai_engine",
+            "LLM_STATE_MACHINE is enabled but the OpenAI client is unavailable.",
+        )
+    if should_use_guided_state_machine(request, rules, openai_client, evaluation):
+        if openai_client is None:
+            raise AdapterError(
+                "openai_ai_engine",
+                "LLM_STATE_MACHINE requires an enabled OpenAI client.",
+            )
+        return classify_guided_learning_response(
+            request=request,
+            rules=rules,
+            safety_check=safety_check,
+            openai_client=openai_client,
+        )
+    authoritative_verification = (
+        uses_authoritative_verification(request)
+        or evaluate_answer_contract(request) == "CORRECT"
+    )
     error_type: ErrorType | None = classify_student_error(request, evaluation, rules)
     response_strategy: ResponseStrategy = select_response_strategy(
         intent=intent,
@@ -145,6 +208,7 @@ def classify_student_response(request: ClassificationRequest) -> TutorResponse:
         )
         openai_message: OpenAITutorMessage | None = build_tutor_message_with_openai(
             request=request,
+            rules=rules,
             intent=deterministic_decision.intent,
             evaluation=deterministic_decision.evaluation,
             error_type=deterministic_decision.error_type,
@@ -232,6 +296,770 @@ def classify_student_response(request: ClassificationRequest) -> TutorResponse:
     )
 
 
+def classify_scaffold_response(
+    request: ClassificationRequest,
+    rules: ClassifierRulesConfig,
+    safety_check: SafetyCheck,
+    openai_client: OpenAIAIEngineClient,
+) -> TutorResponse:
+    context = request.scaffold_evaluation_context
+    if context is None:
+        raise AdapterError(
+            "openai_ai_engine",
+            "Scaffold evaluation context is required.",
+        )
+    last_error: AdapterError | None = None
+    result: ScaffoldStepEvaluation | None = None
+    for attempt in range(rules.guided_learning.maximum_retries + 1):
+        try:
+            result = openai_client.evaluate_scaffold_step(
+                context=context,
+                student_response=request.student_input,
+                input_source=request.input_source,
+                system_prompt=rules.guided_learning.scaffold_evaluator_system_prompt,
+            )
+            break
+        except AdapterError as error:
+            last_error = error
+            logger.warning(
+                "scaffold_evaluation_retry",
+                extra={
+                    "question_id": request.question_id,
+                    "scaffold_id": context.scaffold_id,
+                    "step_id": context.step_id,
+                    "attempt": attempt + 1,
+                    "detail": error.detail,
+                },
+            )
+    if result is None:
+        raise last_error or AdapterError(
+            "openai_ai_engine",
+            f"Scaffold evaluation failed for {context.step_id}.",
+        )
+    satisfied = (
+        result.step_satisfied
+        and result.confidence >= rules.guided_learning.confidence_threshold
+    )
+    original_answer_correct = satisfied and result.original_answer_correct
+    logger.info(
+        "scaffold_step_evaluated",
+        extra={
+            "question_id": request.question_id,
+            "scaffold_id": context.scaffold_id,
+            "step_id": context.step_id,
+            "step_satisfied": satisfied,
+            "original_answer_correct": original_answer_correct,
+            "confidence": result.confidence,
+        },
+    )
+    decision = TutorDecision(
+        intent="SUBMITTING_ANSWER",
+        evaluation="CORRECT" if satisfied else "INCORRECT",
+        error_type=None if satisfied else "INSUFFICIENT_INFORMATION",
+        response_strategy="CONFIRM_CORRECT" if satisfied else "CLARIFY",
+        hint_level=None,
+        canvas_review=None,
+        reasoning_complete=satisfied,
+    )
+    response = build_tutor_response(
+        request=request,
+        rules=rules,
+        safety_check=safety_check,
+        decision=decision,
+        answer_reveal_allowed=False,
+        confidence=result.confidence,
+        tutor_message_override=None,
+        voice_message_override=None,
+    )
+    return response.model_copy(
+        update={
+            "scaffold_original_answer_correct": original_answer_correct,
+        }
+    )
+
+
+def should_use_guided_state_machine(
+    request: ClassificationRequest,
+    rules: ClassifierRulesConfig,
+    openai_client: OpenAIAIEngineClient | None,
+    deterministic_evaluation: EvaluationCategory | None,
+) -> bool:
+    if (
+        request.current_phase != "GUIDED_PRACTICE"
+        or request.phase_2_prompt_context is None
+        or rules.guided_learning.evaluation_mode != "LLM_STATE_MACHINE"
+        or openai_client is None
+    ):
+        return False
+    if request.input_source == "VOICE" and is_low_confidence(
+        request.transcript_confidence,
+        rules,
+    ):
+        return False
+    if request.answer_spec is None or request.question_id is None:
+        return False
+    if (
+        deterministic_evaluation == "CORRECT"
+        and evaluate_answer_contract(request) == "CORRECT"
+        and not requires_multi_component_completion(request, rules)
+    ):
+        return False
+    method = request.answer_spec.verification_method
+    return not (
+        method == "EXACT_CHOICE_MATCH"
+        and deterministic_evaluation in {"CORRECT", "INCORRECT"}
+        and not requires_multi_component_completion(request, rules)
+    )
+
+
+def resolve_guided_rubric(
+    question_id: str,
+    question_type: QuestionType | None,
+    question: str,
+    answer_spec: AnswerSpec,
+    potential_errors: list[dict[str, object]],
+    target_micro_skill_ids: list[str],
+    existing_rubric: GeneratedQuestionRubric | None,
+    rules: ClassifierRulesConfig,
+    openai_client: OpenAIAIEngineClient,
+) -> GeneratedQuestionRubric:
+    """Return the persisted runtime rubric or generate it once from existing content."""
+
+    rubric = existing_rubric
+    if rubric is None or rubric.question_id != question_id:
+        rubric_error: AdapterError | None = None
+        for attempt in range(rules.guided_learning.maximum_retries + 1):
+            try:
+                rubric = openai_client.generate_guided_rubric(
+                    question_id=question_id,
+                    question_type=question_type,
+                    question=question,
+                    answer_spec=answer_spec,
+                    potential_errors=potential_errors,
+                    target_micro_skill_ids=target_micro_skill_ids,
+                    prompt_version=rules.guided_learning.rubric_prompt_version,
+                    system_prompt=rules.guided_learning.rubric_system_prompt,
+                )
+                validate_generated_rubric(
+                    rubric,
+                    question_id,
+                    question_type,
+                    answer_spec,
+                    rules,
+                )
+                break
+            except AdapterError as error:
+                rubric_error = error
+                logger.warning(
+                    "guided_rubric_retry",
+                    extra={
+                        "question_id": question_id,
+                        "attempt": attempt + 1,
+                        "detail": error.detail,
+                    },
+                )
+        if rubric is None:
+            raise rubric_error or AdapterError(
+                "openai_ai_engine",
+                f"Rubric generation failed for {question_id}.",
+            )
+    validate_generated_rubric(
+        rubric,
+        question_id,
+        question_type,
+        answer_spec,
+        rules,
+    )
+    return rubric
+
+
+def classify_guided_learning_response(
+    request: ClassificationRequest,
+    rules: ClassifierRulesConfig,
+    safety_check: SafetyCheck,
+    openai_client: OpenAIAIEngineClient,
+) -> TutorResponse:
+    if request.answer_spec is None or request.question_id is None:
+        raise AdapterError(
+            "openai_ai_engine",
+            "Guided Learning requires question_id and answer_spec.",
+        )
+    context = request.phase_2_prompt_context
+    if context is None:
+        raise AdapterError(
+            "openai_ai_engine",
+            "Guided Learning requires Phase 2 prompt context.",
+        )
+    if (
+        request.answer_spec.verification_method
+        not in rules.guided_learning.supported_verification_methods
+    ):
+        raise AdapterError(
+            "openai_ai_engine",
+            (
+                "Unsupported Guided Learning verification method "
+                f"{request.answer_spec.verification_method} for "
+                f"{request.question_id}."
+            ),
+        )
+    allowed_errors = guided_error_definitions(context.potential_errors)
+    rubric = resolve_guided_rubric(
+        question_id=request.question_id,
+        question_type=request.question_type,
+        question=request.question,
+        answer_spec=request.answer_spec,
+        potential_errors=allowed_errors,
+        target_micro_skill_ids=context.target_micro_skill_ids,
+        existing_rubric=request.generated_question_rubric,
+        rules=rules,
+        openai_client=openai_client,
+    )
+    objective = request.active_teaching_objective or initial_guided_objective(rubric)
+    evaluation: GuidedEvaluation | None = None
+    raw_student_state: GuidedStudentState | None = None
+    raw_confidence: float | None = None
+    last_error: AdapterError | None = None
+    rejected_evaluation: GuidedEvaluation | None = None
+    validation_feedback: str | None = None
+    for attempt in range(rules.guided_learning.maximum_retries + 1):
+        try:
+            candidate = openai_client.evaluate_guided_turn(
+                question_type=request.question_type,
+                question=request.question,
+                answer_spec=request.answer_spec,
+                deterministic_evaluation=evaluate_answer_contract(request),
+                generated_rubric=rubric,
+                active_objective=objective,
+                student_response=request.student_input,
+                input_source=request.input_source,
+                allowed_error_codes=allowed_errors,
+                recent_conversation=request.conversation_history[
+                    -rules.guided_learning.maximum_recent_history_turns:
+                ],
+                validation_feedback=validation_feedback,
+                evaluator_prompt_version=rules.guided_learning.evaluator_prompt_version,
+                system_prompt=rules.guided_learning.evaluator_system_prompt,
+            )
+            raw_student_state = candidate.student_state
+            raw_confidence = candidate.confidence
+            evaluation = validate_guided_evaluation(
+                candidate,
+                rubric,
+                objective,
+                allowed_errors,
+                rules,
+            )
+            if (
+                evaluation.student_state != "CORRECT"
+                and message_reveals_answer(
+                    evaluation.tutor_message,
+                    evaluation.tutor_message_voice,
+                    request.correct_answer,
+                    rules,
+                )
+            ):
+                validation_feedback = (
+                    rules.guided_learning.answer_reveal_retry_feedback
+                )
+                logger.warning(
+                    "guided_answer_reveal_retry",
+                    extra={
+                        "question_id": request.question_id,
+                        "attempt": attempt + 1,
+                        "student_state": evaluation.student_state,
+                    },
+                )
+                rejected_evaluation = evaluation
+                evaluation = None
+                continue
+            break
+        except AdapterError as error:
+            last_error = error
+            validation_feedback = error.detail
+            logger.warning(
+                "guided_evaluation_retry",
+                extra={
+                    "question_id": request.question_id,
+                    "attempt": attempt + 1,
+                    "detail": error.detail,
+                },
+            )
+    if evaluation is None:
+        if rejected_evaluation is not None:
+            logger.warning(
+                "guided_answer_reveal_safe_message",
+                extra={
+                    "question_id": request.question_id,
+                    "student_state": rejected_evaluation.student_state,
+                },
+            )
+            evaluation = rejected_evaluation.model_copy(
+                update={
+                    "tutor_message": rules.guided_learning.reconciliation_message,
+                    "tutor_message_voice": rules.guided_learning.reconciliation_message,
+                }
+            )
+        else:
+            raise last_error or AdapterError(
+                "openai_ai_engine",
+                "Guided turn evaluation failed without a validated response.",
+            )
+    if is_authoritative_guided_completion(request):
+        evaluation = authoritative_guided_completion(evaluation, rules)
+    next_objective = normalized_guided_objective(evaluation, objective)
+    logger.info(
+        "guided_state_evaluated",
+        extra={
+            "question_id": request.question_id,
+            "generated_rubric_hash": rubric.cache_key,
+            "active_objective": (
+                next_objective.model_dump()
+                if next_objective is not None
+                else None
+            ),
+            "student_state": evaluation.student_state,
+            "confidence": evaluation.confidence,
+            "raw_student_state": raw_student_state,
+            "raw_confidence": raw_confidence,
+            "selected_error_code": evaluation.selected_error_code,
+        },
+    )
+    return build_guided_tutor_response(
+        request,
+        rules,
+        safety_check,
+        rubric,
+        evaluation,
+        next_objective,
+    )
+
+
+def authoritative_guided_completion(
+    evaluation: GuidedEvaluation,
+    rules: ClassifierRulesConfig,
+) -> GuidedEvaluation:
+    """Keep a proven answer correct without inventing component evidence."""
+    return evaluation.model_copy(
+        update={
+            "student_state": "CORRECT",
+            "newly_confirmed_concept_ids": [],
+            "preserved_concept_ids": [],
+            "contradicted_concept_ids": [],
+            "missing_concept_ids": [],
+            "selected_error_code": None,
+            "next_objective": None,
+            "tutor_message": rules.messages.CORRECT,
+            "tutor_message_voice": rules.messages.CORRECT,
+        }
+    )
+
+
+def is_authoritative_guided_completion(
+    request: ClassificationRequest,
+) -> bool:
+    """Return whether the contract has proven the whole requested response."""
+    if evaluate_answer_contract(request) != "CORRECT" or request.answer_spec is None:
+        return False
+    return not (
+        request.answer_spec.explanation_required
+        and request.answer_spec.verification_method == "EXACT_CHOICE_MATCH"
+    )
+
+
+def guided_error_definitions(
+    potential_errors: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    definitions: list[dict[str, object]] = []
+    for potential_error in potential_errors:
+        error_code = potential_error.get("error_code")
+        description = (
+            potential_error.get("description")
+            or potential_error.get("error_description")
+        )
+        response_patterns = potential_error.get("response_patterns")
+        if not isinstance(error_code, str):
+            continue
+        definitions.append(
+            {
+                "error_code": error_code,
+                "description": description if isinstance(description, str) else "",
+                "response_patterns": (
+                    [
+                        pattern
+                        for pattern in response_patterns
+                        if isinstance(pattern, str)
+                    ]
+                    if isinstance(response_patterns, list)
+                    else []
+                ),
+            }
+        )
+    return definitions
+
+
+def validate_generated_rubric(
+    rubric: GeneratedQuestionRubric,
+    question_id: str,
+    question_type: QuestionType | None,
+    answer_spec: AnswerSpec,
+    rules: ClassifierRulesConfig,
+) -> None:
+    concept_ids = [concept.concept_id for concept in rubric.required_concepts]
+    if rubric.question_id != question_id:
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Rubric question_id {rubric.question_id} does not match {question_id}.",
+        )
+    if not concept_ids or len(concept_ids) != len(set(concept_ids)):
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Rubric for {question_id} has empty or duplicate concept IDs.",
+        )
+    if (
+        requires_multi_component_rubric(question_type, answer_spec, rules)
+        and len(
+            [
+                concept
+                for concept in rubric.required_concepts
+                if concept.required
+            ]
+        )
+        < 2
+    ):
+        raise AdapterError(
+            "openai_ai_engine",
+            (
+                f"Rubric for {question_id} must contain separate required "
+                "concepts for every answer component."
+            ),
+        )
+
+
+def initial_guided_objective(
+    rubric: GeneratedQuestionRubric,
+) -> ActiveTeachingObjective:
+    required_ids = [
+        concept.concept_id
+        for concept in rubric.required_concepts
+        if concept.required
+    ]
+    return ActiveTeachingObjective(
+        objective_type="ANSWER_QUESTION",
+        target_concept_ids=required_ids,
+        confirmed_concept_ids=[],
+        missing_concept_ids=required_ids,
+    )
+
+
+def validate_guided_evaluation(
+    evaluation: GuidedEvaluation,
+    rubric: GeneratedQuestionRubric,
+    objective: ActiveTeachingObjective,
+    allowed_errors: list[dict[str, object]],
+    rules: ClassifierRulesConfig,
+) -> GuidedEvaluation:
+    concept_ids = {concept.concept_id for concept in rubric.required_concepts}
+    returned_ids = {
+        *evaluation.newly_confirmed_concept_ids,
+        *evaluation.contradicted_concept_ids,
+    }
+    if not returned_ids.issubset(concept_ids):
+        return reconcile_guided_evaluation(
+            evaluation,
+            objective,
+            rules,
+            f"unknown concept IDs: {sorted(returned_ids - concept_ids)}",
+        )
+    allowed_error_codes = {
+        item["error_code"]
+        for item in allowed_errors
+        if isinstance(item.get("error_code"), str)
+    }
+    if (
+        evaluation.selected_error_code is not None
+        and evaluation.selected_error_code not in allowed_error_codes
+    ):
+        return reconcile_guided_evaluation(
+            evaluation,
+            objective,
+            rules,
+            f"disallowed error code: {evaluation.selected_error_code}",
+        )
+    if evaluation.student_state not in rules.guided_learning.allowed_student_states:
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Guided evaluation returned disallowed state {evaluation.student_state}.",
+        )
+    state_threshold = rules.guided_learning.state_confidence_thresholds.get(
+        evaluation.student_state
+    )
+    if state_threshold is None:
+        raise AdapterError(
+            "openai_ai_engine",
+            (
+                "No confidence threshold is configured for Guided Learning "
+                f"state {evaluation.student_state}."
+            ),
+        )
+    if evaluation.confidence < state_threshold:
+        return reconcile_guided_evaluation(
+            evaluation,
+            objective,
+            rules,
+            (
+                f"confidence {evaluation.confidence} below "
+                f"{evaluation.student_state} threshold {state_threshold}"
+            ),
+        )
+    contradicted = set(evaluation.contradicted_concept_ids)
+    confirmed = (
+        set(objective.confirmed_concept_ids)
+        | set(evaluation.newly_confirmed_concept_ids)
+    ) - contradicted
+    required_ids = {
+        concept.concept_id
+        for concept in rubric.required_concepts
+        if concept.required
+    }
+    expected_missing = required_ids - confirmed
+    remaining = set(expected_missing)
+    if (
+        not evaluation.tutor_message.strip()
+        or not evaluation.tutor_message_voice.strip()
+    ):
+        raise AdapterError(
+            "openai_ai_engine",
+            "Guided evaluation must return non-empty text and voice messages.",
+        )
+    if evaluation.student_state == "CORRECT" and remaining:
+        return reconcile_guided_evaluation(
+            evaluation,
+            objective,
+            rules,
+            "CORRECT left required concepts missing",
+        )
+    if evaluation.student_state == "PARTIAL" and (
+        not confirmed or not remaining
+    ):
+        return reconcile_guided_evaluation(
+            evaluation,
+            objective,
+            rules,
+            "PARTIAL did not contain both confirmed and missing concepts",
+        )
+    if evaluation.student_state == "WRONG" and not remaining:
+        return reconcile_guided_evaluation(
+            evaluation,
+            objective,
+            rules,
+            "WRONG confirmed every required concept",
+        )
+    if evaluation.student_state in {"STUCK", "UNCLEAR"} and (
+        evaluation.newly_confirmed_concept_ids
+        or evaluation.selected_error_code is not None
+    ):
+        return reconcile_guided_evaluation(
+            evaluation,
+            objective,
+            rules,
+            f"{evaluation.student_state} attempted to create evidence",
+        )
+    next_objective = (
+        None
+        if evaluation.student_state == "CORRECT"
+        else ActiveTeachingObjective(
+            objective_type=(
+                evaluation.next_objective.objective_type
+                if evaluation.next_objective is not None
+                else objective.objective_type
+            ),
+            target_concept_ids=sorted(remaining),
+            confirmed_concept_ids=sorted(confirmed),
+            missing_concept_ids=sorted(remaining),
+        )
+    )
+    return evaluation.model_copy(
+        update={
+            "preserved_concept_ids": sorted(
+                set(objective.confirmed_concept_ids) - contradicted
+            ),
+            "missing_concept_ids": sorted(remaining),
+            "next_objective": next_objective,
+        }
+    )
+
+
+def reconcile_guided_evaluation(
+    evaluation: GuidedEvaluation,
+    objective: ActiveTeachingObjective,
+    rules: ClassifierRulesConfig,
+    reason: str,
+) -> GuidedEvaluation:
+    logger.warning(
+        "guided_state_reconciled",
+        extra={
+            "raw_student_state": evaluation.student_state,
+            "raw_confidence": evaluation.confidence,
+            "reason": reason,
+        },
+    )
+    message = rules.guided_learning.reconciliation_message
+    return evaluation.model_copy(
+        update={
+            "student_state": "UNCLEAR",
+            "newly_confirmed_concept_ids": [],
+            "preserved_concept_ids": objective.confirmed_concept_ids,
+            "contradicted_concept_ids": [],
+            "missing_concept_ids": objective.missing_concept_ids,
+            "selected_error_code": None,
+            "next_objective": objective,
+            "tutor_message": message,
+            "tutor_message_voice": message,
+        }
+    )
+
+
+def requires_multi_component_rubric(
+    question_type: QuestionType | None,
+    answer_spec: AnswerSpec,
+    rules: ClassifierRulesConfig,
+) -> bool:
+    return (
+        question_type in rules.guided_learning.multi_component_question_types
+        or answer_spec.explanation_required is True
+    )
+
+
+def requires_multi_component_completion(
+    request: ClassificationRequest,
+    rules: ClassifierRulesConfig,
+) -> bool:
+    if request.answer_spec is None:
+        return False
+    return requires_multi_component_rubric(
+        request.question_type,
+        request.answer_spec,
+        rules,
+    )
+
+
+def normalized_guided_objective(
+    evaluation: GuidedEvaluation,
+    previous: ActiveTeachingObjective,
+) -> ActiveTeachingObjective | None:
+    if evaluation.student_state == "CORRECT":
+        return None
+    contradicted = set(evaluation.contradicted_concept_ids)
+    confirmed = (
+        set(previous.confirmed_concept_ids)
+        | set(evaluation.preserved_concept_ids)
+        | set(evaluation.newly_confirmed_concept_ids)
+    ) - contradicted
+    missing = set(evaluation.missing_concept_ids) | contradicted
+    target_ids = (
+        evaluation.next_objective.target_concept_ids
+        if evaluation.next_objective is not None
+        else sorted(missing)
+    )
+    return ActiveTeachingObjective(
+        objective_type=(
+            evaluation.next_objective.objective_type
+            if evaluation.next_objective is not None
+            else "EXPLAIN_CONCEPT"
+        ),
+        target_concept_ids=target_ids,
+        confirmed_concept_ids=sorted(confirmed),
+        missing_concept_ids=sorted(missing),
+    )
+
+
+def build_guided_tutor_response(
+    request: ClassificationRequest,
+    rules: ClassifierRulesConfig,
+    safety_check: SafetyCheck,
+    rubric: GeneratedQuestionRubric,
+    evaluation: GuidedEvaluation,
+    objective: ActiveTeachingObjective | None,
+) -> TutorResponse:
+    state = evaluation.student_state
+    response_strategy: ResponseStrategy = (
+        "CONFIRM_CORRECT"
+        if state == "CORRECT"
+        else "SCAFFOLD"
+        if state == "STUCK"
+        and request.phase_2_prompt_context is not None
+        and request.phase_2_prompt_context.consecutive_stuck_count + 1
+        >= rules.guided_learning.stuck_escalation_count
+        else "CLARIFY"
+        if state in {"PARTIAL", "STUCK", "UNCLEAR"}
+        else "ENCOURAGE_RETRY"
+    )
+    mapped_evaluation: EvaluationCategory = (
+        "CORRECT"
+        if state == "CORRECT"
+        else "PARTIALLY_CORRECT"
+        if state == "PARTIAL"
+        else "INCORRECT"
+        if state == "WRONG"
+        else "NO_ATTEMPT"
+        if state == "STUCK"
+        else "UNCLEAR"
+    )
+    response = TutorResponse(
+        evaluation=mapped_evaluation,
+        error_type="UNKNOWN_ERROR" if state == "WRONG" else None,
+        intent="EXPRESSING_CONFUSION" if state == "STUCK" else "SUBMITTING_ANSWER",
+        response_strategy=response_strategy,
+        tutor_message=evaluation.tutor_message,
+        tutor_message_voice_optimised=evaluation.tutor_message_voice,
+        voice_optimised=True,
+        hint_level=None,
+        scaffold_steps_delivered=[],
+        visual_cue=VisualCue(show=False, cue_type=None, description=None),
+        canvas_feedback=CanvasFeedback(
+            has_feedback=False,
+            step_feedback=[],
+            highlight_instruction=None,
+        ),
+        mistake_classification=None,
+        annotation_intents=[],
+        next_phase_recommendation=request.current_phase,
+        answer_reveal_allowed=False,
+        confidence=evaluation.confidence,
+        input_source=request.input_source,
+        transcript_confidence=request.transcript_confidence,
+        safety_check=safety_check,
+        guardrail_check=GuardrailCheck(
+            passed=True,
+            violation_type=None,
+            action_taken=None,
+        ),
+        student_model_events=[],
+        attempt_increment=1 if state in {"CORRECT", "WRONG"} else 0,
+        recommended_conversation_action=(
+            "ADVANCE_TO_NEXT_QUESTION"
+            if state == "CORRECT"
+            else "REQUEST_EXPLANATION"
+            if state == "PARTIAL"
+            else "REQUEST_CLARIFICATION"
+            if state == "UNCLEAR"
+            else "ASK_QUESTION"
+        ),
+        question_completed=state == "CORRECT",
+        answer_value_confirmed=state == "CORRECT",
+        reasoning_complete=state == "CORRECT",
+        guided_student_state=state,
+        selected_error_code=evaluation.selected_error_code,
+        generated_question_rubric=rubric,
+        active_teaching_objective=objective,
+    )
+    return apply_answer_reveal_guardrail(
+        response,
+        request.correct_answer,
+        rules,
+    )
+
+
 def build_openai_ai_engine_client(settings: Settings) -> OpenAIAIEngineClient | None:
     if settings.use_openai_ai_engine is False:
         return None
@@ -244,8 +1072,198 @@ def build_openai_ai_engine_client(settings: Settings) -> OpenAIAIEngineClient | 
         model=settings.openai_ai_engine_model,
         timeout_seconds=settings.openai_request_timeout_seconds,
         prompt_cache_key_enabled=settings.openai_prompt_cache_key_enabled,
+        store_responses=settings.openai_store_responses,
         retry_count=settings.adapter_request_retry_count,
     )
+
+
+def generate_explain_again_response(
+    request: ExplainAgainRequest,
+) -> ExplainAgainResult:
+    """Generate wording for an explicit Explain Again turn without changing state."""
+
+    rules = load_classifier_rules()
+    validate_explain_again_request(request)
+    openai_client = build_openai_ai_engine_client(get_settings())
+    if openai_client is None:
+        raise AdapterError(
+            "openai_ai_engine",
+            "Explain Again requires an enabled OpenAI AI-engine client.",
+        )
+
+    last_error: AdapterError | None = None
+    validation_feedback: str | None = None
+    for attempt in range(rules.guided_learning.maximum_retries + 1):
+        recent_conversation = request.recent_conversation[
+            -rules.guided_learning.maximum_recent_history_turns:
+        ] if rules.guided_learning.maximum_recent_history_turns > 0 else []
+        prompt_request = request.model_copy(
+            update={"recent_conversation": recent_conversation}
+        )
+        try:
+            message = openai_client.generate_explain_again_message(
+                request=prompt_request,
+                validation_feedback=validation_feedback,
+                prompt_version=rules.guided_learning.explain_again_prompt_version,
+                system_prompt=rules.guided_learning.explain_again_system_prompt,
+            )
+        except AdapterError as error:
+            last_error = error
+            logger.warning(
+                "explain_again_generation_retry",
+                extra={
+                    "question_id": request.question_id,
+                    "attempt": attempt + 1,
+                    "detail": error.detail,
+                },
+            )
+            continue
+        if request.answer_reveal_allowed or (
+            message.answer_reveal_risk is False
+            and not message_reveals_answer(
+            message.tutor_message,
+            message.tutor_message_voice_optimised,
+            request.answer_spec.canonical_answer,
+            rules,
+            )
+        ):
+            return ExplainAgainResult(
+                interaction_type="EXPLAIN_AGAIN",
+                tutor_message=message.tutor_message,
+                tutor_message_voice_optimised=message.tutor_message_voice_optimised,
+                confidence=message.confidence,
+                attempt_increment=0,
+                evaluation_reason_code="EXPLAIN_AGAIN_REEXPRESSION",
+                guided_student_state=request.guided_student_state,
+                active_teaching_objective=request.active_teaching_objective,
+                first_unresolved_concept_id=request.first_unresolved_concept_id,
+                selected_error_code=request.selected_error_code,
+                support_served_this_turn=None,
+                active_support_level=request.active_support_level,
+                highest_support_used=request.highest_support_used,
+                active_scaffold=request.active_scaffold,
+                progression_change_requested=False,
+            )
+        validation_feedback = rules.answer_reveal_guardrail.rewrite_feedback
+        last_error = AdapterError(
+            "openai_ai_engine",
+            (
+                "Explain Again response disclosed the final answer for "
+                f"question_id={request.question_id}."
+            ),
+        )
+        logger.warning(
+            "explain_again_answer_reveal_retry",
+            extra={"question_id": request.question_id, "attempt": attempt + 1},
+        )
+    raise last_error or AdapterError(
+        "openai_ai_engine",
+        f"Explain Again generation failed for question_id={request.question_id}.",
+    )
+
+
+def validate_explain_again_request(request: ExplainAgainRequest) -> None:
+    required_components = [
+        component
+        for component in request.generated_question_rubric.required_concepts
+        if component.required
+    ]
+    component_ids = [component.concept_id for component in required_components]
+    if request.generated_question_rubric.question_id != request.question_id:
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Explain Again rubric does not match question_id={request.question_id}.",
+        )
+    if len(component_ids) != len(set(component_ids)):
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Explain Again requires unique runtime component IDs for {request.question_id}.",
+        )
+    required_ids = set(component_ids)
+    if not required_ids:
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Explain Again requires at least one runtime required component for {request.question_id}.",
+        )
+    active_ids = {
+        *request.active_teaching_objective.target_concept_ids,
+        *request.active_teaching_objective.confirmed_concept_ids,
+        *request.active_teaching_objective.missing_concept_ids,
+    }
+    if not active_ids.issubset(required_ids):
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Explain Again objective has unknown runtime component IDs for {request.question_id}.",
+        )
+    if set(request.active_teaching_objective.confirmed_concept_ids) & set(
+        request.active_teaching_objective.missing_concept_ids
+    ):
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Explain Again objective overlaps confirmed and missing components for {request.question_id}.",
+        )
+    if request.first_unresolved_concept_id not in set(
+        request.active_teaching_objective.missing_concept_ids
+    ):
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Explain Again first unresolved component is not missing for {request.question_id}.",
+        )
+    objective_ids = {
+        *request.active_teaching_objective.confirmed_concept_ids,
+        *request.active_teaching_objective.missing_concept_ids,
+    }
+    if objective_ids != required_ids:
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Explain Again objective omits runtime required components for {request.question_id}.",
+        )
+    first_missing = next(
+        component
+        for component in required_components
+        if component.concept_id in request.active_teaching_objective.missing_concept_ids
+    )
+    if request.first_unresolved_concept_id != first_missing.concept_id:
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Explain Again first unresolved component is out of runtime rubric order for {request.question_id}.",
+        )
+    if (request.selected_error_code is None) != (
+        request.recorded_misconception is None
+    ):
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Explain Again selected error and recorded misconception must both be present or absent for {request.question_id}.",
+        )
+    if request.recorded_misconception is not None and (
+        request.recorded_misconception.error_code != request.selected_error_code
+    ):
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Explain Again misconception does not match selected error for {request.question_id}.",
+        )
+    support_rank = {
+        "NONE": 0,
+        "HINT": 1,
+        "VISUAL_CUE": 2,
+        "SCAFFOLD": 3,
+        "PARALLEL_EXAMPLE": 4,
+        "TUTOR_SOLVED": 5,
+    }
+    if support_rank[request.active_support_level] > support_rank[
+        request.highest_support_used
+    ]:
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Explain Again active support exceeds highest support for {request.question_id}.",
+        )
+    if request.active_scaffold is not None and (
+        request.active_scaffold.step_number > request.active_scaffold.total_steps
+    ):
+        raise AdapterError(
+            "openai_ai_engine",
+            f"Explain Again scaffold step exceeds total steps for {request.question_id}.",
+        )
 
 
 def generate_tutor_turn_with_openai(
@@ -264,6 +1282,8 @@ def generate_tutor_turn_with_openai(
             question=request.question,
             correct_answer=request.correct_answer,
             answer_spec=request.answer_spec,
+            phase_2_prompt_context=request.phase_2_prompt_context,
+            active_triggers=detect_protocol_triggers(request, rules),
             student_input=request.student_input,
             phase=request.current_phase,
             input_source=request.input_source,
@@ -287,11 +1307,35 @@ def generate_tutor_turn_with_openai(
         return None
 
 
+def detect_protocol_triggers(
+    request: ClassificationRequest,
+    rules: ClassifierRulesConfig,
+) -> list[Trigger]:
+    triggers: list[Trigger] = []
+    if (
+        request.input_source == "VOICE"
+        and is_low_confidence(request.transcript_confidence, rules)
+    ):
+        triggers.append(Trigger.VOICE_AMBIGUITY)
+    if (
+        request.input_source == "CANVAS"
+        and request.canvas_regions
+        and any(
+            region.confidence < rules.canvas_review.min_region_confidence
+            for region in request.canvas_regions
+        )
+    ):
+        triggers.append(Trigger.HANDWRITING_AMBIGUITY)
+    return triggers
+
+
 def should_use_deterministic_tutor_turn(
     request: ClassificationRequest,
     intent: IntentType,
     rules: ClassifierRulesConfig,
 ) -> bool:
+    if evaluate_answer_contract(request) == "CORRECT":
+        return True
     if intent in {"REQUESTING_ANSWER", "ATTEMPTING_OVERRIDE"}:
         return True
     return request.input_source == "VOICE" and is_low_confidence(
@@ -310,12 +1354,18 @@ def build_openai_tutor_decision(
 ) -> TutorDecision:
     intent = (
         deterministic_intent
-        if deterministic_evaluation == "CORRECT"
+        if (
+            deterministic_intent != "SUBMITTING_ANSWER"
+            or deterministic_evaluation == "CORRECT"
+        )
         else openai_turn.intent
     )
     evaluation = (
         deterministic_evaluation
-        if authoritative_verification
+        if (
+            deterministic_intent != "SUBMITTING_ANSWER"
+            or authoritative_verification
+        )
         else (
             "CORRECT"
             if deterministic_evaluation == "CORRECT"
@@ -372,6 +1422,7 @@ def build_openai_tutor_decision(
 
 def build_tutor_message_with_openai(
     request: ClassificationRequest,
+    rules: ClassifierRulesConfig,
     intent: IntentType,
     evaluation: EvaluationCategory | None,
     error_type: ErrorType | None,
@@ -389,24 +1440,47 @@ def build_tutor_message_with_openai(
     if request.input_source == "CANVAS" and canvas_context is None:
         return None
 
-    try:
-        return openai_client.build_tutor_message(
-            question=request.question,
-            student_input=request.student_input,
-            evaluation=evaluation,
-            error_type=error_type,
-            response_strategy=response_strategy,
-            hint_level=hint_level,
-            phase=request.current_phase,
-            conversation_history=request.conversation_history,
-            canvas_context=canvas_context,
-        )
-    except AdapterError as error:
+    rejected_message: str | None = None
+    validation_feedback: str | None = None
+    for attempt in range(rules.guided_learning.maximum_retries + 1):
+        try:
+            message = openai_client.build_tutor_message(
+                question=request.question,
+                student_input=request.student_input,
+                evaluation=evaluation,
+                error_type=error_type,
+                response_strategy=response_strategy,
+                hint_level=hint_level,
+                phase=request.current_phase,
+                conversation_history=request.conversation_history,
+                canvas_context=canvas_context,
+                rejected_tutor_message=rejected_message,
+                validation_feedback=validation_feedback,
+            )
+        except AdapterError as error:
+            logger.warning(
+                "openai_ai_engine_fallback",
+                extra={"step": "tutor_message", "detail": error.message},
+            )
+            return None
+        if not message_reveals_answer(
+            message.tutor_message,
+            message.tutor_message_voice_optimised,
+            request.correct_answer,
+            rules,
+        ):
+            return message
+        rejected_message = message.tutor_message
+        validation_feedback = rules.answer_reveal_guardrail.rewrite_feedback
         logger.warning(
-            "openai_ai_engine_fallback",
-            extra={"step": "tutor_message", "detail": error.message},
+            "tutor_message_answer_reveal_retry",
+            extra={
+                "question_id": request.question_id,
+                "attempt": attempt + 1,
+                "input_source": request.input_source,
+            },
         )
-        return None
+    return None
 
 
 def check_student_message_safety(student_input: str, rules: ClassifierRulesConfig) -> SafetyCheck:
@@ -487,6 +1561,14 @@ _SUPERSCRIPT_CHARACTERS: dict[str, str] = {
     "⁸": "8",
     "⁹": "9",
 }
+_FRACTION_CHARACTERS: dict[str, str] = {
+    "½": "1/2",
+    "⅓": "1/3",
+    "¼": "1/4",
+    "¾": "3/4",
+    "⅔": "2/3",
+    "⅛": "1/8",
+}
 
 
 def uses_authoritative_verification(request: ClassificationRequest) -> bool:
@@ -518,17 +1600,42 @@ def evaluate_answer_contract(
             normalize_exact_notation(answer)
             for answer in accepted_answers
         }
-        return "CORRECT" if student_notation in accepted_notation else "INCORRECT"
+        return (
+            "CORRECT"
+            if student_notation in accepted_notation
+            or contains_accepted_exact_notation(
+                request.student_input,
+                accepted_notation,
+            )
+            else "INCORRECT"
+        )
     if method == "SYMBOLIC_EQUIVALENCE":
         return (
             "CORRECT"
             if is_symbolically_equivalent(request.student_input, accepted_answers)
             else "INCORRECT"
         )
-    if normalize_semantic_answer(request.student_input) in {
-        normalize_semantic_answer(answer)
-        for answer in accepted_answers
-    }:
+    normalized_input = normalize_semantic_answer(request.student_input)
+    concept_required_methods = {
+        "CHOICE_AND_CONCEPT_MATCH",
+        "BOOLEAN_AND_CONCEPT_MATCH",
+    }
+    if (
+        normalized_input == normalize_semantic_answer(
+            answer_spec.canonical_answer
+        )
+        and method not in concept_required_methods
+    ):
+        return "CORRECT"
+    if (
+        method == "CONCEPT_TEXT_MATCH"
+        and ";" not in answer_spec.canonical_answer
+        and normalized_input
+        in {
+            normalize_semantic_answer(answer)
+            for answer in answer_spec.accepted_answers
+        }
+    ):
         return "CORRECT"
     return None
 
@@ -552,12 +1659,61 @@ def normalize_exact_notation(value: str) -> str:
         result.append(character)
         index += 1
     compact = "".join(result).replace("−", "-").replace("⁄", "/")
+    for fraction, expanded in _FRACTION_CHARACTERS.items():
+        compact = compact.replace(fraction, expanded)
     compact = re.sub(r"\s+", "", compact)
+    compact = re.sub(r"\((\d+/\d+)\)(?=[A-Za-z])", r"\1", compact)
     return re.sub(r"\^\{(\d+)\}", r"^\1", compact)
 
 
+def contains_accepted_exact_notation(
+    student_input: str,
+    accepted_notation: set[str],
+) -> bool:
+    normalized_input = _normalize_superscript_notation(student_input)
+    for notation in accepted_notation:
+        if notation == "":
+            continue
+        spaced_notation = r"\s*".join(re.escape(character) for character in notation)
+        start_boundary = r"(?<!\w)" if notation[0].isalnum() else ""
+        end_boundary = r"(?!\w)" if notation[-1].isalnum() else ""
+        if re.search(
+            f"{start_boundary}{spaced_notation}{end_boundary}",
+            normalized_input,
+            flags=re.IGNORECASE,
+        ):
+            return True
+    return False
+
+
+def _normalize_superscript_notation(value: str) -> str:
+    normalized = unicodedata.normalize("NFC", value)
+    for superscript, digit in _SUPERSCRIPT_CHARACTERS.items():
+        normalized = normalized.replace(superscript, f"^{digit}")
+    normalized = normalized.replace("−", "-").replace("⁄", "/")
+    return re.sub(r"\^\{(\d+)\}", r"^\1", normalized)
+
+
 def normalize_semantic_answer(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    normalized = unicodedata.normalize("NFKC", value).lower()
+    normalized = normalized.replace("⁄", "/").replace("−", "-")
+    normalized = re.sub(
+        r"\b(?:is\s+)?multiplied\s+by\b|\btimes\b|\bmultiply\s+by\b",
+        " multiply ",
+        normalized,
+    )
+    normalized = re.sub(r"\bdivided\s+by\b|\bdivide\s+by\b", " divide ", normalized)
+    normalized = re.sub(r"\bplus\b", " add ", normalized)
+    normalized = re.sub(r"\bminus\b", " subtract ", normalized)
+    normalized = re.sub(r"\bis\s+equal\s+to\b|\bequals?\b", " equal ", normalized)
+    normalized = re.sub(r"(?<=\w)\s+x\s+(?=\w)", " multiply ", normalized)
+    normalized = re.sub(r"[×·*]", " multiply ", normalized)
+    normalized = normalized.replace("÷", " divide ")
+    normalized = normalized.replace("/", " divide ")
+    normalized = normalized.replace("+", " add ")
+    normalized = normalized.replace("-", " subtract ")
+    normalized = normalized.replace("=", " equal ")
+    return re.sub(r"[^a-z0-9]+", " ", normalized).strip()
 
 
 def is_symbolically_equivalent(
@@ -650,6 +1806,15 @@ def select_response_strategy(
 ) -> ResponseStrategy:
     if intent == "ACKNOWLEDGEMENT":
         return "CONTINUE"
+    if (
+        intent == "EXPRESSING_CONFUSION"
+        and current_phase == rules.strategy_rules.guided_practice_phase
+    ):
+        if attempt_count >= rules.strategy_rules.worked_example_min_attempt_count:
+            return "PROVIDE_WORKED_EXAMPLE"
+        if attempt_count >= rules.strategy_rules.scaffold_min_attempt_count:
+            return "SCAFFOLD"
+        return "GUIDED_HINT"
     if intent in rules.strategy_rules.clarify_intents:
         return "CLARIFY"
     if intent == rules.strategy_rules.hint_intent:
@@ -965,7 +2130,12 @@ def apply_answer_reveal_guardrail(
 ) -> TutorResponse:
     if response.answer_reveal_allowed is True:
         return response
-    if contains_answer_reveal(response.tutor_message, correct_answer, rules) is False:
+    if not message_reveals_answer(
+        response.tutor_message,
+        response.tutor_message_voice_optimised,
+        correct_answer,
+        rules,
+    ):
         return response
 
     if response.evaluation == "CORRECT":
@@ -1021,17 +2191,38 @@ def apply_retrieved_hint(
 def contains_answer_reveal(message: str, correct_answer: str, rules: ClassifierRulesConfig) -> bool:
     normalized_message: str = normalize_text(message)
     normalized_correct_answer: str = normalize_text(correct_answer)
-    correct_value: float | None = extract_last_number(correct_answer)
 
     if normalized_correct_answer != "" and normalized_correct_answer in normalized_message:
         return True
     if contains_any(normalized_message, rules.answer_reveal_guardrail.reveal_phrases):
         return True
-    if correct_value is None:
+    correct_numbers: list[str] = re.findall(r"-?\d+(?:\.\d+)?", correct_answer)
+    if len(correct_numbers) != 1:
         return False
 
-    correct_number: str = format_number_for_matching(correct_value)
-    return re.search(rf"(?<![\d.])-?{re.escape(correct_number)}(?![\d.])", normalized_message) is not None
+    correct_value: float = float(correct_numbers[0])
+    message_numbers: list[str] = re.findall(
+        r"-?\d+(?:\.\d+)?",
+        normalized_message,
+    )
+    return any(float(value) == correct_value for value in message_numbers)
+
+
+def message_reveals_answer(
+    message: str,
+    voice_message: str,
+    correct_answer: str,
+    rules: ClassifierRulesConfig,
+) -> bool:
+    return contains_answer_reveal(
+        message,
+        correct_answer,
+        rules,
+    ) or contains_answer_reveal(
+        voice_message,
+        correct_answer,
+        rules,
+    )
 
 
 def detects_direct_answer_request(normalized_input: str, rules: ClassifierRulesConfig) -> bool:
@@ -1220,6 +2411,17 @@ def is_reasoning_required(
     request: ClassificationRequest,
     rules: ClassifierRulesConfig,
 ) -> bool:
+    if (
+        request.answer_spec is not None
+        and request.answer_spec.verification_method == "CONCEPT_TEXT_MATCH"
+        and evaluate_answer_contract(request) == "CORRECT"
+    ):
+        return False
+    if (
+        request.answer_spec is not None
+        and request.answer_spec.explanation_required is not None
+    ):
+        return request.answer_spec.explanation_required
     if uses_authoritative_verification(request):
         return False
     return request.current_phase in rules.reasoning_completion.required_phases

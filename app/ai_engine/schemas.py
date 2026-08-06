@@ -5,6 +5,16 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from app.models.adapters import ConversationAction
+from app.models.guided_learning import (
+    ActiveScaffold,
+    ActiveScaffold as ActiveScaffoldState,
+    ActiveTeachingObjective,
+    GeneratedQuestionRubric,
+    GuidedStudentState,
+)
+
+from app.models.student_model_session import AnswerSpec, SupportUsed
+
 
 
 EvaluationCategory = Literal[
@@ -62,6 +72,7 @@ LearningPhase = Literal[
     "REVIEW",
 ]
 
+
 LearningEventType = Literal[
     "CORRECT_ATTEMPT",
     "INCORRECT_ATTEMPT",
@@ -104,6 +115,59 @@ class VisualCue(StrictSchema):
     show: StrictBool
     cue_type: VisualCueType | None
     description: str | None
+    actions: list[dict[str, object]] = Field(default_factory=list)
+
+
+class ExplainAgainSupportState(StrictSchema):
+    active_support_level: SupportUsed
+    highest_support_used: SupportUsed
+    support_reason_code: str | None
+
+
+class ExplainAgainConversationMessage(StrictSchema):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1)
+
+
+class ExplainAgainVisualCue(StrictSchema):
+    show: StrictBool
+    cue_type: str | None
+    description: str | None
+    actions: list[dict[str, object]] = Field(default_factory=list)
+
+
+class ExplainAgainRequest(StrictSchema):
+    question_id: str | None = None
+    question: str | None = None
+    concept_id: str | None = None
+    current_phase: LearningPhase | None = None
+    generated_question_rubric: GeneratedQuestionRubric | None = None
+    active_teaching_objective: ActiveTeachingObjective | None = None
+    first_unresolved_concept_id: str | None = None
+    recent_conversation: list[object] = Field(default_factory=list)
+    visible_cue: ExplainAgainVisualCue | None = None
+    active_scaffold: ActiveScaffoldState | None = None
+    support_state: ExplainAgainSupportState | None = None
+    selected_error_code: str | None = None
+    misconception_evidence: str | None = None
+    recorded_misconception: RecordedMisconception | None = None
+    guided_student_state: GuidedStudentState | None = None
+    active_support_level: SupportUsed | None = None
+    highest_support_used: SupportUsed | None = None
+    visible_visual_cue: VisualCue | None = None
+    answer_reveal_allowed: StrictBool = False
+    answer_spec: AnswerSpec | None = None
+    session_id: str | None = None
+    student_id: str | None = None
+
+
+
+class ExplainAgainResponse(StrictSchema):
+    tutor_message: str = Field(min_length=1)
+    tutor_message_voice: str = Field(min_length=1)
+    answer_reveal_allowed: Literal[False]
+    progression_change_requested: Literal[False]
+    attempt_increment: Literal[0]
 
 
 class HighlightInstruction(StrictSchema):
@@ -206,3 +270,44 @@ class TutorResponse(StrictSchema):
     question_completed: StrictBool
     answer_value_confirmed: StrictBool = False
     reasoning_complete: StrictBool = False
+    guided_student_state: GuidedStudentState | None = None
+    selected_error_code: str | None = None
+    generated_question_rubric: GeneratedQuestionRubric | None = None
+    active_teaching_objective: ActiveTeachingObjective | None = None
+    scaffold_original_answer_correct: StrictBool = False
+
+
+class ExplainAgainResult(StrictSchema):
+    interaction_type: str = "EXPLAIN_AGAIN"
+    tutor_message: str
+    tutor_message_voice_optimised: str
+    confidence: float
+    attempt_increment: int = 0
+    evaluation_reason_code: str
+    guided_student_state: GuidedStudentState | None = None
+    active_teaching_objective: ActiveTeachingObjective | None = None
+    first_unresolved_concept_id: str | None = None
+    selected_error_code: str | None = None
+    support_served_this_turn: SupportUsed | None = None
+    active_support_level: SupportUsed | None = None
+    highest_support_used: SupportUsed | None = None
+    active_scaffold: ActiveScaffoldState | None = None
+    progression_change_requested: StrictBool = False
+
+
+
+class OpenAIExplainAgainMessage(StrictSchema):
+    tutor_message: str
+    tutor_message_voice_optimised: str
+    confidence: float
+    answer_reveal_risk: StrictBool = False
+
+
+class RecordedMisconception(StrictSchema):
+    error_code: str
+    description: str
+
+
+
+
+

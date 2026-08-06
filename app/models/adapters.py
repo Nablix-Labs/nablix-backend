@@ -10,7 +10,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models.student_model_session import AnswerSpec
+from app.models.student_model_session import AnswerSpec, QuestionType
+from app.models.guided_learning import (
+    ActiveTeachingObjective,
+    GeneratedQuestionRubric,
+    GuidedStudentState,
+    ScaffoldEvaluationContext,
+)
 
 MasteryStatus = Literal[
     "NEW_LEARNER",
@@ -19,6 +25,7 @@ MasteryStatus = Literal[
     "MASTERED",
     "LEARNING_GAP",
     "REVIEW_DUE",
+    "RESTART_RECOMMENDED",
 ]
 ContinuityStatus = Literal[
     "on_track",
@@ -61,6 +68,18 @@ class ConversationState(BaseModel):
     expected_student_response: ExpectedStudentResponse
 
 
+class Phase2PromptContext(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    target_micro_skill_ids: list[str]
+    support_state: dict[str, object]
+    potential_errors: list[dict[str, object]]
+    support_catalog: dict[str, object]
+    current_support: dict[str, object] | None
+    current_scaffold_step_number: int
+    consecutive_stuck_count: int
+
+
 class AdapterContext(BaseModel):
     """Shared input for the three text adapters (tutor, RAG, student model).
 
@@ -71,10 +90,13 @@ class AdapterContext(BaseModel):
     session_id: str
     student_id: str
     source_turn_id: str | None = None
+    question_id: str | None = None
+    question_type: QuestionType | None = None
     message: str
     question: str | None = None
     correct_answer: str | None = None
     answer_spec: AnswerSpec | None = None
+    phase_2_prompt_context: Phase2PromptContext | None = None
     current_phase: str | None = None
     input_source: str | None = None
     transcript_confidence: float | None = None
@@ -91,6 +113,9 @@ class AdapterContext(BaseModel):
     canvas_regions: list["OCRTextRegion"] = Field(default_factory=list)
     conversation_history: list["ConversationMessage"] = Field(default_factory=list)
     conversation_state: ConversationState | None = None
+    generated_question_rubric: GeneratedQuestionRubric | None = None
+    active_teaching_objective: ActiveTeachingObjective | None = None
+    scaffold_evaluation_context: ScaffoldEvaluationContext | None = None
 
 
 class ConversationMessage(BaseModel):
@@ -147,6 +172,7 @@ class VisualCue(BaseModel):
     show: bool = False
     cue_type: str | None = None
     description: str | None = None
+    actions: list[dict[str, object]] = Field(default_factory=list)
 
 
 class CanvasStepFeedback(BaseModel):
@@ -168,9 +194,32 @@ class CanvasFeedback(BaseModel):
     highlight_instruction: HighlightInstruction | None = None
 
 
+class SpatialMathToken(BaseModel):
+    token_id: str
+    step_id: str
+    text: str
+    latex: str | None = None
+    role: Literal[
+        "number",
+        "identifier",
+        "operator",
+        "fraction_bar",
+        "radical",
+        "fence",
+        "unknown",
+    ] = "unknown"
+    semantic_path: str = ""
+    stroke_ids: list[str] = Field(default_factory=list)
+    bounding_box: dict[str, float] = Field(default_factory=dict)  # x, y, width, height in 0..1
+    alignment_confidence: float = 1.0
+
+
 class TutorMistakeClassification(BaseModel):
     status: Literal["mistake_found", "no_mistake", "uncertain"]
     mistake_step_id: str | None = None
+    target_token_ids: list[str] = Field(default_factory=list)
+    error_token: str | None = None
+    expected_token: str | None = None
     target_text: str | None = None
     target_span: tuple[int, int] | None = None
     replacement_text: str | None = None
@@ -182,6 +231,7 @@ class AnnotationIntent(BaseModel):
     target_step_id: str
     text: str | None = None
     placement: Literal["right", "below"] | None = None
+
 
 
 class TutorResult(BaseModel):
@@ -210,6 +260,11 @@ class TutorResult(BaseModel):
     question_completed: bool
     answer_value_confirmed: bool = False
     reasoning_complete: bool = False
+    guided_student_state: GuidedStudentState | None = None
+    selected_error_code: str | None = None
+    generated_question_rubric: GeneratedQuestionRubric | None = None
+    active_teaching_objective: ActiveTeachingObjective | None = None
+    scaffold_original_answer_correct: bool = False
 
 
 class VoiceResult(BaseModel):

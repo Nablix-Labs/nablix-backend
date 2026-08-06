@@ -22,13 +22,51 @@ from app.models.fields import (
     StudentId,
     TurnId,
 )
+from app.models.guided_learning import (
+    ActiveTeachingObjective,
+    GeneratedQuestionRubric,
+    GuidedStudentState,
+    InactivityPolicy,
+    inactivity_policy,
+)
 from app.models.session_review import SessionReviewResponse
 from app.models.student_model_session import (
     PublicStudentModelEvent,
+    QuestionType,
     StudentModelCoreState,
     StudentModelSessionEventResponse,
 )
 from app.services.phase1_tutor import Phase1TutorMessages
+
+
+NudgeDeliveryStatus = Literal[
+    "GENERATED",
+    "PRESENTED",
+]
+
+
+class InactivityPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    initial_idle_threshold_ms: int = Field(ge=1)
+    cooldown_ms: int = Field(ge=1)
+    max_nudges_per_tutor_turn: int = Field(ge=1)
+    generated_nudge_rate_limit: int = Field(ge=1)
+
+
+class NudgeDeliveryRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    interaction_id: TurnId
+    session_id: SessionId
+    source_tutor_turn_id: TurnId
+    question_id: QuestionId
+    message: str
+    message_voice: str
+    status: NudgeDeliveryStatus
+    created_at: datetime
+    presented_at: datetime | None = None
+    acknowledged_at: datetime | None = None
 
 
 class VoiceState(BaseModel):
@@ -149,6 +187,7 @@ class SessionRecord(BaseModel):
     current_phase: Phase
     previous_phase: Phase | None = None
     current_question: str | None
+    question_type: QuestionType | None = None
     question_id: QuestionId | None
     question_number: int
     # Answer key served with the question (Qdrant payload or demo stub).
@@ -172,6 +211,28 @@ class SessionRecord(BaseModel):
     allow_voice_input: bool = True
     hint_count: int
     attempt_count: int = 0
+    wrong_attempt_count: int = 0
+    interaction_state_version: int = 0
+    nudge_generated_count: int = 0
+    nudge_presented_count: int = 0
+    last_tutor_response_at: datetime
+    last_nudge_generated_at: datetime | None = None
+    pending_nudge_id: TurnId | None = None
+    pending_nudge_message: str | None = None
+    stuck_count: int = 0
+    wrong_attempt_count: int = 0
+    selected_error_code: str | None = None
+    last_tutor_response_at: datetime | None = None
+    inactivity_policy: InactivityPolicy | None = None
+    # Consecutive REQUEST_EXPLANATION turns on the current question. PARTIAL
+    # explanation turns carry attempt_increment=0, so without this nothing
+    # counts them and nothing can cap them (31 Jul: 29 consecutive rejections
+    # of a reasonable explanation, session unwinnable).
+    explanation_request_count: int = 0
+    generated_question_rubric: GeneratedQuestionRubric | None = None
+    active_teaching_objective: ActiveTeachingObjective | None = None
+    guided_student_state: GuidedStudentState | None = None
+    selected_error_code: str | None = None
     question_completed: bool = False
     answer_value_confirmed: bool = False
     conversation_history: list[ConversationMessage] = Field(default_factory=list)
@@ -179,7 +240,12 @@ class SessionRecord(BaseModel):
     last_tutor_turn_id: TurnId | None = None
     last_tutor_action: TutorAction = "ASKED_QUESTION"
     expected_student_response: ExpectedStudentResponse = "ANSWER"
+    scaffold_id: str | None = None
+    current_scaffold_step_id: str | None = None
     scaffold_step_number: int = 0
+    scaffold_total_steps: int = 0
+    delivered_scaffold_step_ids: list[str] = Field(default_factory=list)
+    scaffold_expected_response: str | None = None
     rescue_mode_active: bool = False
     mastery_check_question_count: int = 0
     # Functional fields the guide omits but the backend needs.
@@ -203,4 +269,15 @@ class SessionResponse(SessionRecord):
     model_config = ConfigDict(from_attributes=True)
 
     correct_answer: str | None = Field(default=None, exclude=True)
+    scaffold_steps: list[str] = Field(default_factory=list, exclude=True)
+    scaffold_expected_response: str | None = Field(default=None, exclude=True)
     student_model_event: PublicStudentModelEvent | None = None
+    generated_question_rubric: GeneratedQuestionRubric | None = Field(
+        default=None,
+        exclude=True,
+    )
+    active_teaching_objective: ActiveTeachingObjective | None = Field(
+        default=None,
+        exclude=True,
+    )
+    inactivity_policy: InactivityPolicy = Field(default_factory=inactivity_policy)

@@ -33,9 +33,19 @@ def schema_visual_cue(
             continue
         content_id = item.get("content_id")
         description = item.get("description")
+        actions = item.get("actions", [])
         if not isinstance(content_id, str) or not isinstance(description, str):
             raise RuntimeError("Student Model returned a malformed visual cue.")
-        return VisualCue(show=True, cue_type=content_id, description=description)
+        if not isinstance(actions, list) or not all(
+            isinstance(action, dict) for action in actions
+        ):
+            raise RuntimeError("Student Model returned malformed visual cue actions.")
+        return VisualCue(
+            show=True,
+            cue_type=content_id,
+            description=description,
+            actions=actions,
+        )
     return None
 
 
@@ -93,7 +103,8 @@ def _active_phase_state(
         "PHASE_3_INDEPENDENT_PRACTICE": journey.phase_3_independent_practice,
         "REVIEW": journey.review,
     }
-    return phase_states[journey.current_phase]
+    effective_phase = journey.recommended_entry_phase or journey.current_phase
+    return phase_states[effective_phase]
 
 
 def project_student_model_state(

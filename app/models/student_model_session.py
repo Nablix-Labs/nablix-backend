@@ -1,3 +1,4 @@
+from enum import StrEnum
 from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -21,6 +22,18 @@ SupportUsed = Literal[
 ]
 
 
+class RoutingReasonCode(StrEnum):
+    DIAGNOSTIC_STARTED = "DIAGNOSTIC_STARTED"
+    DIAGNOSTIC_GAPS_FOUND = "DIAGNOSTIC_GAPS_FOUND"
+    DIAGNOSTIC_NO_GAPS = "DIAGNOSTIC_NO_GAPS"
+    ORIENTATION_STARTED = "ORIENTATION_STARTED"
+    ORIENTATION_COMPLETED = "ORIENTATION_COMPLETED"
+    GUIDED_IN_PROGRESS = "GUIDED_IN_PROGRESS"
+    GUIDED_HINT_REQUIRED = "GUIDED_HINT_REQUIRED"
+    GUIDED_SCAFFOLD_REQUIRED = "GUIDED_SCAFFOLD_REQUIRED"
+    GUIDED_COMPLETED = "GUIDED_COMPLETED"
+
+
 class MicroSkillMapping(BaseModel):
     micro_skill_id: str
     is_primary: bool
@@ -32,18 +45,32 @@ class QuestionOption(BaseModel):
     text: str
 
 
+QuestionType = Literal[
+    "SINGLE_CHOICE",
+    "SHORT_RESPONSE",
+    "MULTI_PART_SHORT_RESPONSE",
+    "CHOICE_WITH_EXPLANATION",
+    "TRUE_FALSE_WITH_EXPLANATION",
+]
+
+
 class StudentQuestionView(BaseModel):
     question_text: str
-    question_type: str
+    question_type: QuestionType
     options: list[QuestionOption]
     requires_student_response: bool
 
 
 class AnswerSpec(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     answer_spec_id: str
     canonical_answer: str
     accepted_answers: list[str]
     verification_method: str
+    explanation_required: bool | None = None
+    answer_steps: list[str] = Field(default_factory=list)
+
 
 
 class TutorQuestionView(BaseModel):
@@ -51,6 +78,7 @@ class TutorQuestionView(BaseModel):
 
     answer_spec: AnswerSpec
     potential_errors: list[dict[str, object]] = Field(default_factory=list)
+    support_catalog: dict[str, object] = Field(default_factory=dict)
 
 
 class StudentModelQuestion(BaseModel):
@@ -124,7 +152,7 @@ class StudentModelPhasePayload(BaseModel):
 
 
 class StudentModelRouting(BaseModel):
-    reason_code: str
+    reason_code: RoutingReasonCode
     reason: str
     next_action: str
     next_topic_id: str | None = None
@@ -157,6 +185,7 @@ class JourneyPhaseState(BaseModel):
     retry_required_micro_skill_ids: list[str] = Field(default_factory=list)
     highest_support_used_by_skill: dict[str, SupportUsed] = Field(default_factory=dict)
     current_question_id: str | None = None
+    current_question_target_micro_skill_ids: list[str] = Field(default_factory=list)
     used_question_ids: list[str] = Field(default_factory=list)
 
 
@@ -250,27 +279,32 @@ class SessionOpenedEvent(SessionEventBase):
     event_type: Literal["SESSION_OPENED"]
 
 
+class MutatingSessionEventBase(SessionEventBase):
+    source_turn_id: str
+    expected_journey_version: int
+
+
 class MicroSkillResult(BaseModel):
     micro_skill_id: str
     result: DiagnosticResult
 
 
-class DiagnosticCompletedEvent(SessionEventBase):
+class DiagnosticCompletedEvent(MutatingSessionEventBase):
     event_type: Literal["DIAGNOSTIC_COMPLETED"]
     micro_skill_results: list[MicroSkillResult]
 
 
-class WorkedExampleRequestedEvent(SessionEventBase):
+class WorkedExampleRequestedEvent(MutatingSessionEventBase):
     event_type: Literal["WORKED_EXAMPLE_REQUESTED"]
     target_micro_skill_ids: list[str]
 
 
-class OrientationCompletedEvent(SessionEventBase):
+class OrientationCompletedEvent(MutatingSessionEventBase):
     event_type: Literal["ORIENTATION_COMPLETED"]
     target_micro_skill_ids: list[str]
 
 
-class GuidedAttemptEvent(SessionEventBase):
+class GuidedAttemptEvent(MutatingSessionEventBase):
     event_type: Literal["CORRECT_ATTEMPT", "INCORRECT_ATTEMPT"]
     question_id: str
     micro_skill_ids: list[str]
@@ -279,21 +313,24 @@ class GuidedAttemptEvent(SessionEventBase):
     error_code: str | None = None
 
 
-class GuidedSupportEvent(SessionEventBase):
+class GuidedSupportEvent(MutatingSessionEventBase):
     event_type: Literal[
         "GUIDED_SUPPORT_ESCALATION_REQUIRED",
+        "MAXIMUM_GUIDED_SUPPORT_PARALLEL",
         "MAXIMUM_GUIDED_SUPPORT_REQUIRED",
     ]
     question_id: str
     micro_skill_id: str
+    triggering_response: str
+    error_code: str
 
 
-class GuidedPhaseCompletedEvent(SessionEventBase):
+class GuidedPhaseCompletedEvent(MutatingSessionEventBase):
     event_type: Literal["GUIDED_PHASE_COMPLETED"]
     completed_micro_skill_ids: list[str]
 
 
-class IndependentRetryCompletedEvent(SessionEventBase):
+class IndependentRetryCompletedEvent(MutatingSessionEventBase):
     event_type: Literal["INDEPENDENT_RETRY_COMPLETED"]
     question_id: str
     micro_skill_ids: list[str]
@@ -302,7 +339,7 @@ class IndependentRetryCompletedEvent(SessionEventBase):
     error_code: str | None = None
 
 
-class GuidedQuestionSetRequestedEvent(SessionEventBase):
+class GuidedQuestionSetRequestedEvent(MutatingSessionEventBase):
     event_type: Literal["GUIDED_QUESTION_SET_REQUESTED"]
     target_micro_skill_ids: list[str]
 
@@ -312,7 +349,7 @@ class Phase2RepairResult(BaseModel):
     highest_support_used: SupportUsed
 
 
-class IndependentQuestionSetRequestedEvent(SessionEventBase):
+class IndependentQuestionSetRequestedEvent(MutatingSessionEventBase):
     event_type: Literal["INDEPENDENT_QUESTION_SET_REQUESTED"]
     phase2_repair_results: list[Phase2RepairResult]
     used_question_ids: list[str]

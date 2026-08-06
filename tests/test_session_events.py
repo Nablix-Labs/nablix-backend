@@ -8,7 +8,8 @@ from app.adapters import provider, student_model
 from app.core.config import Settings
 from app.core.exceptions import AdapterError
 from app.main import app
-from app.services import session_service
+from app.ai_engine.classifier_config import load_classifier_rules
+from app.services import interaction_service, session_service
 
 
 client = TestClient(app, headers={"Authorization": "Bearer test-token"})
@@ -16,6 +17,38 @@ SessionEventPost = Callable[
     [str, str, dict[str, object], dict[str, str], int, int],
     Awaitable[dict[str, object]],
 ]
+
+
+def test_scaffold_response_matching_accepts_safe_variants() -> None:
+    rules = load_classifier_rules()
+    accepted = [
+        ("½", "½"),
+        ("1/2", "½"),
+        ("one half is multiplying x", "½"),
+        ("it is in front of x", "Before x"),
+        ("1/2x", "½x"),
+        ("on both sides", "Both sides"),
+    ]
+    rejected = [
+        ("1", "½"),
+        ("before x", "½"),
+        ("x/2", "½x"),
+    ]
+
+    for student_message, expected_response in accepted:
+        assert interaction_service._scaffold_response_is_correct(
+            student_message,
+            expected_response,
+            "INCORRECT",
+            rules,
+        )
+    for student_message, expected_response in rejected:
+        assert not interaction_service._scaffold_response_is_correct(
+            student_message,
+            expected_response,
+            "PARTIALLY_CORRECT",
+            rules,
+        )
 
 
 def _diagnostic_started_response() -> dict[str, object]:
@@ -309,6 +342,7 @@ def _event_response(
             "remaining_micro_skill_ids": ["T02.M1"],
             "highest_support_used_by_skill": {},
             "current_question_id": "Q-T02-004",
+            "current_question_target_micro_skill_ids": ["T02.M1"],
             "used_question_ids": [],
         }
         question_set = deepcopy(
@@ -320,9 +354,30 @@ def _event_response(
         question["question_id"] = "Q-T02-004"
         question["question_usage_id"] = "QU-T02-004-P2"
         question["question_role"] = "GUIDED"
+        question["micro_skill_mappings"] = [
+            {
+                "micro_skill_id": "T02.M5",
+                "is_primary": True,
+                "weight": 0.7,
+            },
+            {
+                "micro_skill_id": "T02.M1",
+                "is_primary": False,
+                "weight": 0.3,
+            },
+        ]
         question["student_view"]["question_text"] = "Solve for x: x + 4 = 9"
         question["tutor_view"]["answer_spec"]["canonical_answer"] = "x = 5"
         question["tutor_view"]["answer_spec"]["accepted_answers"] = ["x = 5"]
+        question["tutor_view"]["potential_errors"] = [
+            {
+                "error_code": "ERR-T02-SUBTRACTION-MISAPPLIED",
+                "error_description": "Subtraction was applied incorrectly.",
+                "detection_method": "EXACT_NOTATION_MATCH",
+                "response_patterns": ["x = 4"],
+                "linked_misconceptions": [],
+            }
+        ]
         payload.update(
             {
                 "phase": "PHASE_2_GUIDED_LEARNING",
@@ -390,6 +445,7 @@ def _event_response(
             "remaining_micro_skill_ids": ["T02.M1"],
             "highest_support_used_by_skill": {"T02.M1": "HINT"},
             "current_question_id": "Q-T02-004",
+            "current_question_target_micro_skill_ids": ["T02.M1"],
             "used_question_ids": [],
         }
         payload["payload_type"] = "SUPPORT_AND_RETRY"
@@ -406,6 +462,13 @@ def _event_response(
                     "content_type": "VISUAL_CUE",
                     "content_id": "VC-T02-COEFFICIENT-COUNT",
                     "description": "Count the equal letter terms.",
+                    "actions": [
+                        {
+                            "action": "HIGHLIGHT_TOKEN",
+                            "target": "x",
+                            "style": "VARIABLE",
+                        }
+                    ],
                 }
             ],
             "retry_same_question": True,
@@ -463,10 +526,29 @@ def _event_response(
         payload["support_to_serve"] = {
             "support_type": "SCAFFOLD",
             "scaffold_id": "SCF-T02-M1",
+            "current_step_id": "SCF-T02-M1-S1",
+            "prompt": "Which operation should you undo first?",
+            "expected_response": "Addition",
             "steps": [
                 {
                     "step_id": "SCF-T02-M1-S1",
                     "prompt": "Which operation should you undo first?",
+                    "expected_response": "Addition",
+                },
+                {
+                    "step_id": "SCF-T02-M1-S2",
+                    "prompt": "What should you subtract from both sides?",
+                    "expected_response": "4",
+                },
+                {
+                    "step_id": "SCF-T02-M1-S3",
+                    "prompt": "Where should you subtract 4?",
+                    "expected_response": "Both sides",
+                },
+                {
+                    "step_id": "SCF-T02-M1-S4",
+                    "prompt": "What is the resulting value of x?",
+                    "expected_response": "x = 5",
                 }
             ],
             "retry_same_question": True,
@@ -560,7 +642,6 @@ def _use_live_student_model(
     settings = Settings(
         student_model_url="https://student-model.example",
         student_model_topic_codes={"ALG_LINEAR_ONE_STEP": "ALG-ORI-02"},
-        student_model_session_opened_enabled=True,
         use_mock_student_model=False,
     )
     monkeypatch.setattr(provider, "get_settings", lambda: settings)
@@ -607,6 +688,7 @@ def test_session_start_uses_schema_3_diagnostic_contract_by_default(monkeypatch)
     body = response.json()
     assert body["current_phase"] == "DIAGNOSTIC"
     assert body["current_question"] == "What does 4y mean?"
+    assert body["question_type"] == "SINGLE_CHOICE"
     assert body["question_id"] == "Q-T02-D01"
     assert body["show_canvas"] is False
     assert body["show_hint_button"] is False
@@ -660,7 +742,7 @@ def test_session_start_uses_schema_3_diagnostic_contract_by_default(monkeypatch)
     assert captured["headers"] == {"Authorization": "Bearer test-token"}
     payload = captured["payload"]
     assert isinstance(payload, dict)
-    assert payload["event_type"] == "DIAGNOSTIC_QUESTION_SET_REQUESTED"
+    assert payload["event_type"] == "SESSION_OPENED"
     assert payload["topic_id"] == "ALG-ORI-02"
     assert payload["student_id"] == "ST001"
     assert isinstance(payload["timestamp"], str)
@@ -717,6 +799,67 @@ def test_session_start_restores_each_student_model_phase(
     assert body["question_id"] == expected_question_id
     assert body["recommended_entry_phase"] == expected_phase
     assert body["student_model_event"]["phase_payload"]["phase"] == student_model_phase
+
+
+def test_session_start_restores_saved_question_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_post_json(
+        adapter_name: str,
+        url: str,
+        payload: dict[str, object],
+        headers: dict[str, str],
+        timeout_seconds: int,
+        retry_count: int,
+    ) -> dict[str, object]:
+        del adapter_name, url, headers, timeout_seconds, retry_count
+        response = _session_opened_response("PHASE_3_INDEPENDENT_PRACTICE")
+        response["request_id"] = payload["request_id"]
+        journey = response["journey_state"]
+        phase_payload = response["phase_payload"]
+        assert isinstance(journey, dict)
+        assert isinstance(phase_payload, dict)
+        phase_state = journey["phase_3_independent_practice"]
+        question_set = phase_payload["question_set"]
+        assert isinstance(phase_state, dict)
+        assert isinstance(question_set, dict)
+        questions = question_set["questions"]
+        assert isinstance(questions, list)
+        second_question = deepcopy(questions[0])
+        assert isinstance(second_question, dict)
+        second_question["question_id"] = "Q-T02-I02"
+        second_question["question_usage_id"] = "QU-T02-I02-P3"
+        student_view = second_question["student_view"]
+        tutor_view = second_question["tutor_view"]
+        assert isinstance(student_view, dict)
+        assert isinstance(tutor_view, dict)
+        answer_spec = tutor_view["answer_spec"]
+        assert isinstance(answer_spec, dict)
+        student_view["question_text"] = "Solve for x: 2x = 14"
+        answer_spec["canonical_answer"] = "x = 7"
+        answer_spec["accepted_answers"] = ["x = 7"]
+        questions.append(second_question)
+        phase_state["current_question_id"] = "Q-T02-I02"
+        return response
+
+    _use_live_student_model(monkeypatch, fake_post_json)
+
+    response = client.post(
+        "/session/start",
+        json={
+            "student_id": "ST001",
+            "concept_id": "ALG_LINEAR_ONE_STEP",
+            "interaction_mode": "TEXT",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["current_phase"] == "INDEPENDENT_PRACTICE"
+    assert body["question_id"] == "Q-T02-I02"
+    assert body["question_number"] == 2
+    assert body["current_question"] == "Solve for x: 2x = 14"
+    assert session_service._sessions[body["session_id"]].correct_answer == "x = 7"
 
 
 def test_repeated_session_start_restores_authoritative_progress(
@@ -841,6 +984,12 @@ def test_session_start_restores_guided_support_presentation(
     ) -> dict[str, object]:
         del adapter_name, url, headers, timeout_seconds, retry_count
         response = _event_response("INCORRECT_ATTEMPT", str(payload["request_id"]))
+        journey = response["journey_state"]
+        assert isinstance(journey, dict)
+        phase_state = journey["phase_2_guided_learning"]
+        assert isinstance(phase_state, dict)
+        phase_state["current_attempt_sequence"] = 2
+        phase_state["current_hint_count"] = 1
         return response
 
     _use_live_student_model(monkeypatch, fake_post_json)
@@ -861,6 +1010,8 @@ def test_session_start_restores_guided_support_presentation(
     assert body["show_visual_cue"] is True
     assert body["show_scaffold_panel"] is False
     assert body["message"] == "Undo the addition first."
+    assert body["attempt_count"] == 1
+    assert body["hint_count"] == 1
 
 
 def test_session_start_restores_independent_rescue_presentation(
@@ -893,10 +1044,7 @@ def test_session_start_restores_independent_rescue_presentation(
     body = response.json()
     assert body["current_phase"] == "INDEPENDENT_PRACTICE"
     assert body["show_scaffold_panel"] is True
-    assert body["scaffold_steps"] == [
-        "Undo the addition.",
-        "Then divide both sides.",
-    ]
+    assert "scaffold_steps" not in body
 
 
 @pytest.mark.parametrize(
@@ -935,6 +1083,16 @@ def test_restored_not_started_phase_initializes_before_answer(
             question = question_set["questions"][0]
             assert isinstance(question, dict)
             question["question_id"] = "Q-T02-INITIALIZED"
+            journey = response["journey_state"]
+            assert isinstance(journey, dict)
+            phase_key = (
+                "phase_2_guided_learning"
+                if phase == "PHASE_2_GUIDED_LEARNING"
+                else "phase_3_independent_practice"
+            )
+            phase_state = journey[phase_key]
+            assert isinstance(phase_state, dict)
+            phase_state["current_question_id"] = "Q-T02-INITIALIZED"
         elif phase == "PHASE_2_GUIDED_LEARNING":
             response = _event_response("INCORRECT_ATTEMPT", "")
         else:
@@ -953,6 +1111,15 @@ def test_restored_not_started_phase_initializes_before_answer(
     )
     assert started.status_code == 200
     body = started.json()
+    session = session_service._sessions[body["session_id"]]
+    session_service._sessions[body["session_id"]] = session.model_copy(
+        update={
+            "current_question": None,
+            "question_type": None,
+            "question_id": None,
+            "correct_answer": None,
+        }
+    )
 
     answered = client.post(
         "/interaction",
@@ -961,6 +1128,8 @@ def test_restored_not_started_phase_initializes_before_answer(
             "student_id": "ST001",
             "interaction_type": "ANSWER_SUBMISSION",
             "input_source": "TEXT",
+            "turn_id": "TURN-RESTORED-ANSWER-1",
+            "previous_tutor_turn_id": session.last_tutor_turn_id,
             "text_input": "x = 4",
             "current_phase": body["current_phase"],
             "concept_id": "ALG_LINEAR_ONE_STEP",
@@ -983,19 +1152,19 @@ def test_restored_not_started_phase_initializes_before_answer(
         assert events[1]["used_question_ids"] == []
     else:
         assert events[1]["target_micro_skill_ids"] == ["T02.M1"]
-def test_student_model_request_ids_remain_unique_after_session_counter_restart() -> None:
+def test_student_model_request_ids_are_stable_across_retries() -> None:
     first = session_service._student_model_request_id(
         "SESSION001",
+        "TURN001",
         "DIAGNOSTIC_QUESTION_SET_REQUESTED",
     )
     second = session_service._student_model_request_id(
         "SESSION001",
+        "TURN001",
         "DIAGNOSTIC_QUESTION_SET_REQUESTED",
     )
 
-    assert first != second
-    assert first.startswith("SESSION001:DIAGNOSTIC_QUESTION_SET_REQUESTED:")
-    assert second.startswith("SESSION001:DIAGNOSTIC_QUESTION_SET_REQUESTED:")
+    assert first == second == "SESSION001:TURN001:DIAGNOSTIC_QUESTION_SET_REQUESTED"
 
 
 def test_diagnostic_and_orientation_lifecycle_uses_micro_skills(monkeypatch) -> None:
@@ -1110,11 +1279,172 @@ def test_diagnostic_and_orientation_lifecycle_uses_micro_skills(monkeypatch) -> 
     assert completed["student_model_state"]["target_micro_skill_ids"] == ["T02.M1"]
     assert completed["message"] == "Now let’s use this idea together in a question."
     assert [event["event_type"] for event in events] == [
-        "DIAGNOSTIC_QUESTION_SET_REQUESTED",
+        "SESSION_OPENED",
         "DIAGNOSTIC_COMPLETED",
         "WORKED_EXAMPLE_REQUESTED",
         "ORIENTATION_COMPLETED",
     ]
+
+    event_count_before_stuck = len(events)
+    for expected_stuck_count in (1, 2):
+        stuck = client.post(
+            "/interaction",
+            json={
+                "session_id": session_id,
+                "student_id": "ST001",
+                "interaction_type": "ANSWER_SUBMISSION",
+                "input_source": "TEXT",
+                "turn_id": f"TURN-STUCK-{expected_stuck_count}",
+                "text_input": "I don't know",
+                "current_phase": "GUIDED_PRACTICE",
+                "concept_id": "ALG_LINEAR_ONE_STEP",
+                "question_id": "Q-T02-004",
+                "hint_count": 0,
+            },
+        )
+
+        assert stuck.status_code == 200
+        assert stuck.json()["attempt_count"] == 0
+        if expected_stuck_count == 1:
+            assert len(events) == event_count_before_stuck
+            assert "scaffold_steps" not in stuck.json()
+            assert stuck.json()["current_scaffold_step_id"] is None
+        else:
+            assert len(events) == event_count_before_stuck + 1
+            assert events[-1]["event_type"] == "GUIDED_SUPPORT_ESCALATION_REQUIRED"
+            assert events[-1]["micro_skill_id"] == "T02.M1"
+            assert stuck.json()["scaffold_step_text"] == (
+                "Which operation should you undo first?"
+            )
+            assert stuck.json()["current_scaffold_step_id"] == "SCF-T02-M1-S1"
+            assert stuck.json()["message"] == "Which operation should you undo first?"
+        assert "scaffold_expected_response" not in stuck.json()
+        assert client.get(f"/session/{session_id}").json()["stuck_count"] == (
+            expected_stuck_count
+        )
+
+    scaffold_event_count = len(events)
+    wrong_scaffold_step = client.post(
+        "/interaction",
+        json={
+            "session_id": session_id,
+            "student_id": "ST001",
+            "interaction_type": "ANSWER_SUBMISSION",
+            "input_source": "TEXT",
+            "turn_id": "TURN-SCAFFOLD-WRONG-1",
+            "text_input": "subtraction",
+            "current_phase": "GUIDED_PRACTICE",
+            "concept_id": "ALG_LINEAR_ONE_STEP",
+            "question_id": "Q-T02-004",
+            "hint_count": 0,
+        },
+    )
+    assert wrong_scaffold_step.status_code == 200
+    assert len(events) == scaffold_event_count
+    assert wrong_scaffold_step.json()["current_scaffold_step_id"] == "SCF-T02-M1-S1"
+    assert wrong_scaffold_step.json()["scaffold_step_number"] == 1
+    assert "scaffold_steps" not in wrong_scaffold_step.json()
+    assert wrong_scaffold_step.json()["scaffold_step_text"] == (
+        "Which operation should you undo first?"
+    )
+    assert wrong_scaffold_step.json()["message"] == (
+        "Let’s stay with this step: Which operation should you undo first?"
+    )
+
+    next_scaffold_step = client.post(
+        "/interaction",
+        json={
+            "session_id": session_id,
+            "student_id": "ST001",
+            "interaction_type": "ANSWER_SUBMISSION",
+            "input_source": "TEXT",
+            "turn_id": "TURN-SCAFFOLD-NEXT-1",
+            "text_input": "addition",
+            "current_phase": "GUIDED_PRACTICE",
+            "concept_id": "ALG_LINEAR_ONE_STEP",
+            "question_id": "Q-T02-004",
+            "hint_count": 0,
+        },
+    )
+    assert next_scaffold_step.status_code == 200
+    assert len(events) == scaffold_event_count
+    assert next_scaffold_step.json()["current_scaffold_step_id"] == "SCF-T02-M1-S2"
+    assert next_scaffold_step.json()["scaffold_step_number"] == 2
+    assert next_scaffold_step.json()["total_scaffold_steps"] == 4
+    assert next_scaffold_step.json()["scaffold_step_text"] == (
+        "What should you subtract from both sides?"
+    )
+    assert next_scaffold_step.json()["scaffold_step_voice"] == (
+        "What should you subtract from both sides?"
+    )
+
+    third_scaffold_step = client.post(
+        "/interaction",
+        json={
+            "session_id": session_id,
+            "student_id": "ST001",
+            "interaction_type": "ANSWER_SUBMISSION",
+            "input_source": "TEXT",
+            "turn_id": "TURN-SCAFFOLD-THIRD-1",
+            "text_input": "4",
+            "current_phase": "GUIDED_PRACTICE",
+            "concept_id": "ALG_LINEAR_ONE_STEP",
+            "question_id": "Q-T02-004",
+            "hint_count": 0,
+        },
+    )
+    assert third_scaffold_step.status_code == 200
+    assert third_scaffold_step.json()["current_scaffold_step_id"] == "SCF-T02-M1-S3"
+    assert third_scaffold_step.json()["scaffold_step_number"] == 3
+    assert third_scaffold_step.json()["scaffold_step_text"] == (
+        "Where should you subtract 4?"
+    )
+
+    fourth_scaffold_step = client.post(
+        "/interaction",
+        json={
+            "session_id": session_id,
+            "student_id": "ST001",
+            "interaction_type": "ANSWER_SUBMISSION",
+            "input_source": "TEXT",
+            "turn_id": "TURN-SCAFFOLD-FOURTH-1",
+            "text_input": "on both sides",
+            "current_phase": "GUIDED_PRACTICE",
+            "concept_id": "ALG_LINEAR_ONE_STEP",
+            "question_id": "Q-T02-004",
+            "hint_count": 0,
+        },
+    )
+    assert fourth_scaffold_step.status_code == 200
+    assert fourth_scaffold_step.json()["current_scaffold_step_id"] == "SCF-T02-M1-S4"
+    assert fourth_scaffold_step.json()["scaffold_step_number"] == 4
+    assert fourth_scaffold_step.json()["scaffold_step_text"] == (
+        "What is the resulting value of x?"
+    )
+
+    completed_scaffold = client.post(
+        "/interaction",
+        json={
+            "session_id": session_id,
+            "student_id": "ST001",
+            "interaction_type": "ANSWER_SUBMISSION",
+            "input_source": "TEXT",
+            "turn_id": "TURN-SCAFFOLD-COMPLETE-1",
+            "text_input": "x = 5",
+            "current_phase": "GUIDED_PRACTICE",
+            "concept_id": "ALG_LINEAR_ONE_STEP",
+            "question_id": "Q-T02-004",
+            "hint_count": 0,
+        },
+    )
+    assert completed_scaffold.status_code == 200
+    assert len(events) == scaffold_event_count
+    assert completed_scaffold.json()["current_scaffold_step_id"] is None
+    assert completed_scaffold.json()["show_scaffold_panel"] is False
+    assert "scaffold_steps" not in completed_scaffold.json()
+    assert completed_scaffold.json()["message"] == (
+        "Now use those steps on the original question. What would you try first?"
+    )
 
     guided_incorrect = client.post(
         "/interaction",
@@ -1123,6 +1453,7 @@ def test_diagnostic_and_orientation_lifecycle_uses_micro_skills(monkeypatch) -> 
             "student_id": "ST001",
             "interaction_type": "ANSWER_SUBMISSION",
             "input_source": "TEXT",
+            "turn_id": "TURN-GUIDED-WRONG-1",
             "text_input": "x = 4",
             "current_phase": "GUIDED_PRACTICE",
             "concept_id": "ALG_LINEAR_ONE_STEP",
@@ -1136,19 +1467,30 @@ def test_diagnostic_and_orientation_lifecycle_uses_micro_skills(monkeypatch) -> 
     assert events[-1]["question_id"] == "Q-T02-004"
     assert events[-1]["micro_skill_ids"] == ["T02.M1"]
     assert events[-1]["student_response"] == "x = 4"
-    assert isinstance(events[-1]["error_code"], str)
+    assert events[-1]["error_code"] == "ERR-T02-SUBTRACTION-MISAPPLIED"
+    assert client.get(f"/session/{session_id}").json()["stuck_count"] == 0
     assert guided_incorrect.json()["student_model_state"][
         "highest_support_used_by_skill"
     ] == {"T02.M1": "HINT"}
     assert guided_incorrect.json()["show_visual_cue"] is True
     assert guided_incorrect.json()["visual_cue"] == {
         "show": True,
-        "cue_type": "VC-T02-COEFFICIENT-COUNT",
-        "description": "Count the equal letter terms.",
-    }
-    assert guided_incorrect.json()["message"] == "Undo the addition first."
+            "cue_type": "VC-T02-COEFFICIENT-COUNT",
+            "description": "Count the equal letter terms.",
+            "actions": [
+                {
+                    "action": "HIGHLIGHT_TOKEN",
+                    "target": "x",
+                    "style": "VARIABLE",
+                }
+            ],
+        }
+    assert guided_incorrect.json()["message"] == (
+        "Let us review the equation and try the next step carefully. "
+        "Undo the addition first."
+    )
 
-    for answer in ("x = 3", "x = 2"):
+    for wrong_number in range(2, 5):
         guided_incorrect = client.post(
             "/interaction",
             json={
@@ -1156,7 +1498,8 @@ def test_diagnostic_and_orientation_lifecycle_uses_micro_skills(monkeypatch) -> 
                 "student_id": "ST001",
                 "interaction_type": "ANSWER_SUBMISSION",
                 "input_source": "TEXT",
-                "text_input": answer,
+                "turn_id": f"TURN-GUIDED-WRONG-{wrong_number}",
+                "text_input": "x = 4",
                 "current_phase": "GUIDED_PRACTICE",
                 "concept_id": "ALG_LINEAR_ONE_STEP",
                 "question_id": "Q-T02-004",
@@ -1164,13 +1507,36 @@ def test_diagnostic_and_orientation_lifecycle_uses_micro_skills(monkeypatch) -> 
             },
         )
         assert guided_incorrect.status_code == 200
+        assert guided_incorrect.json()["wrong_attempt_count"] == wrong_number
 
-    assert events[-2]["event_type"] == "INCORRECT_ATTEMPT"
     assert events[-1]["event_type"] == "GUIDED_SUPPORT_ESCALATION_REQUIRED"
+    assert events[-1]["micro_skill_id"] == "T02.M1"
+    assert events[-1]["triggering_response"] == "x = 4"
+    assert events[-1]["error_code"] == "ERR-T02-SUBTRACTION-MISAPPLIED"
+    assert guided_incorrect.json()["support_reason_code"] == "WRONG_4_INTERVENTION"
     assert guided_incorrect.json()["show_scaffold_panel"] is True
-    assert guided_incorrect.json()["scaffold_steps"] == [
-        "Which operation should you undo first?"
-    ]
+    assert guided_incorrect.json()["current_scaffold_step_id"] == "SCF-T02-M1-S1"
+
+    for scaffold_answer in ("addition", "4", "on both sides", "x = 5"):
+        scaffold_response = client.post(
+            "/interaction",
+            json={
+                "session_id": session_id,
+                "student_id": "ST001",
+                "interaction_type": "ANSWER_SUBMISSION",
+                "input_source": "TEXT",
+                "turn_id": f"TURN-SCAFFOLD-ANSWER-{scaffold_answer}",
+                "text_input": scaffold_answer,
+                "current_phase": "GUIDED_PRACTICE",
+                "concept_id": "ALG_LINEAR_ONE_STEP",
+                "question_id": "Q-T02-004",
+                "hint_count": 0,
+            },
+        )
+        assert scaffold_response.status_code == 200
+
+    assert scaffold_response.json()["show_scaffold_panel"] is False
+    assert scaffold_response.json()["current_scaffold_step_id"] is None
 
     guided = client.post(
         "/interaction",
@@ -1179,6 +1545,7 @@ def test_diagnostic_and_orientation_lifecycle_uses_micro_skills(monkeypatch) -> 
             "student_id": "ST001",
             "interaction_type": "ANSWER_SUBMISSION",
             "input_source": "TEXT",
+            "turn_id": "TURN-GUIDED-CORRECT-1",
             "text_input": "x = 5",
             "current_phase": "GUIDED_PRACTICE",
             "concept_id": "ALG_LINEAR_ONE_STEP",
@@ -1309,7 +1676,7 @@ def test_diagnostic_requires_every_mapping_for_one_skill_to_be_correct(monkeypat
     ) -> dict[str, object]:
         del adapter_name, url, headers, timeout_seconds, retry_count
         captured.update(payload)
-        if payload["event_type"] == "DIAGNOSTIC_QUESTION_SET_REQUESTED":
+        if payload["event_type"] == "SESSION_OPENED":
             response = _diagnostic_started_response()
             phase_payload = response["phase_payload"]
             assert isinstance(phase_payload, dict)
@@ -1618,7 +1985,7 @@ def test_session_start_fails_without_topic_mapping_or_remote_service(
     assert set(session_service._sessions) == sessions_before
 
 
-def test_legacy_session_keeps_legacy_student_model_interaction(monkeypatch) -> None:
+def test_legacy_initial_phase_session_is_rejected(monkeypatch) -> None:
     captured: dict[str, object] = {}
     settings = Settings(
         student_model_url="https://student-model.example",
@@ -1659,24 +2026,6 @@ def test_legacy_session_keeps_legacy_student_model_interaction(monkeypatch) -> N
             "initial_phase": "GUIDED_PRACTICE",
         },
     )
-    assert started.status_code == 200
-    session_id = started.json()["session_id"]
-    assert started.json()["student_model_event"] is None
-
-    interaction = client.post(
-        "/interaction",
-        json={
-            "session_id": session_id,
-            "student_id": "ST001",
-            "interaction_type": "ANSWER_SUBMISSION",
-            "input_source": "TEXT",
-            "text_input": "x = 3",
-            "current_phase": "GUIDED_PRACTICE",
-            "concept_id": "ALG_LINEAR_ONE_STEP",
-            "question_id": "ALG_EQ_GP_001",
-            "hint_count": 0,
-        },
-    )
-    assert interaction.status_code == 200
-    assert captured["url"] == "https://student-model.example/interaction"
-    assert captured["headers"] == {"Authorization": "Bearer test-token"}
+    assert started.status_code == 409
+    assert "Legacy initial_phase sessions are not supported" in started.json()["message"]
+    assert captured == {}
