@@ -1,4 +1,4 @@
-from enum import StrEnum
+from enum import Enum
 from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -23,7 +23,7 @@ SupportUsed = Literal[
 ]
 
 
-class RoutingReasonCode(StrEnum):
+class RoutingReasonCode(str, Enum):
     DIAGNOSTIC_STARTED = "DIAGNOSTIC_STARTED"
     DIAGNOSTIC_GAPS_FOUND = "DIAGNOSTIC_GAPS_FOUND"
     DIAGNOSTIC_NO_GAPS = "DIAGNOSTIC_NO_GAPS"
@@ -31,8 +31,12 @@ class RoutingReasonCode(StrEnum):
     ORIENTATION_COMPLETED = "ORIENTATION_COMPLETED"
     GUIDED_IN_PROGRESS = "GUIDED_IN_PROGRESS"
     GUIDED_HINT_REQUIRED = "GUIDED_HINT_REQUIRED"
+    GUIDED_VISUAL_SUPPORT_REQUIRED = "GUIDED_VISUAL_SUPPORT_REQUIRED"
     GUIDED_SCAFFOLD_REQUIRED = "GUIDED_SCAFFOLD_REQUIRED"
     GUIDED_COMPLETED = "GUIDED_COMPLETED"
+    GUIDED_PHASE_COMPLETED = "GUIDED_PHASE_COMPLETED"
+    PARALLEL_EXAMPLE_REQUIRED = "PARALLEL_EXAMPLE_REQUIRED"
+    SESSION_RESUMED = "SESSION_RESUMED"
 
 
 class MicroSkillMapping(BaseModel):

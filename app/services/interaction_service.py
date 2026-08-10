@@ -1,13 +1,16 @@
+import hashlib
+import json
 import re
 from datetime import datetime, timezone
-from typing import Final, Literal
+from dataclasses import dataclass
+from time import perf_counter
+from typing import Final, Literal, cast
 from uuid import uuid4
 
 from fastapi import HTTPException
 
 from app.adapters.base import StudentModelAdapter
 from app.adapters.provider import get_adapters
-from app.ai_engine import classifier
 from app.ai_engine.classifier import (
     build_openai_ai_engine_client,
     contains_answer_reveal,
@@ -15,19 +18,10 @@ from app.ai_engine.classifier import (
     normalize_exact_notation,
 )
 
-from app.ai_engine.schemas import (
-    ExplainAgainConversationMessage,
-    ExplainAgainRequest,
-    ExplainAgainSupportState,
-    ExplainAgainVisualCue,
-)
 from app.ai_engine.classifier_config import ClassifierRulesConfig, load_classifier_rules
 from app.ai_engine.schemas import (
     ActiveScaffoldState,
-    ExplainAgainConversationMessage,
     ExplainAgainRequest,
-    ExplainAgainSupportState,
-    ExplainAgainVisualCue,
     RecordedMisconception,
     VisibleVisualCue as AIVisibleVisualCue,
 )
@@ -43,9 +37,12 @@ from app.models.adapters import (
     Phase2PromptContext,
     RAGResult,
     StudentModelResult,
+    OCRTextRegion,
+    SpatialMathToken,
     TutorAction,
     TutorResult,
     VisualCue,
+    VisionOCRResult,
 )
 from app.models.fields import Phase
 from app.models.guided_learning import (
@@ -76,9 +73,17 @@ from app.models.student_model_session import (
     IndependentQuestionSetRequestedEvent,
     IndependentRetryCompletedEvent,
     Phase2RepairResult,
+    QuestionType,
     StudentModelSessionEventResponse,
     StudentModelQuestion,
     SupportUsed,
+)
+from app.services.guided_question_opening import guided_question_opening
+from app.services.canvas_annotations import assign_step_ids, plan_canvas_draw
+from app.services.canvas_spatial import (
+    align_step_tokens,
+    associate_strokes_with_steps,
+    parse_mathml_tokens,
 )
 from app.services.phase_transition import (
     DEFAULT_TRANSITION_MESSAGE,
@@ -91,6 +96,7 @@ from app.services.session_service import (
     get_canvas_submission,
     interaction_lock_for,
     inactivity_policy,
+    interaction_payload_fingerprint_for,
     last_interaction_response_for,
     nudge_deliveries_for_tutor_turn,
     nudge_delivery_for,
@@ -102,6 +108,7 @@ from app.services.session_service import (
 from app.services.student_model_session import (
     PHASE_FROM_STUDENT_MODEL,
 )
+from app.services.snapshot_store import build_reference, store_snapshot
 
 
 _NUMBER_WORD_VALUES: Final[dict[str, str]] = {
@@ -164,13 +171,6 @@ _SUPPORT_RANK: tuple[SupportUsed, ...] = (
     "PARALLEL_EXAMPLE",
     "TUTOR_SOLVED",
 )
-_EXPLAIN_AGAIN_SYSTEM_PROMPT = """
-Explain the current mathematical idea in a genuinely different way for the same
-learner and question. Use the supplied confirmed and missing components, active
-support, cue, and scaffold context. Do not grade, reveal the final answer, change
-progression, escalate support, or alter the active scaffold. Return only the
-strict response schema.
-""".strip()
 _INACTIVITY_MESSAGE = "Are you still with me? Take your time and continue when you're ready."
 _EVALUATION_REASON_BY_STATE: dict[str, EvaluationReasonCode] = {
     "CORRECT": EvaluationReasonCode.ALL_REQUIRED_COMPONENTS_CONFIRMED,
@@ -185,6 +185,87 @@ _WRONG_ESCALATION_BY_COUNT: dict[int, WrongEscalationCode] = {
     3: WrongEscalationCode.WRONG_3_VISUAL_CUE,
     4: WrongEscalationCode.WRONG_4_INTERVENTION,
 }
+
+
+@dataclass(frozen=True)
+class _CanvasEvidence:
+    submission_id: str
+    snapshot_reference: str
+    ocr: VisionOCRResult
+    spatial_tokens: list[SpatialMathToken]
+    ocr_latency_ms: float
+
+
+def _normalised_mathml_tokens(mathml: str) -> str:
+    return "".join(token.text for token in parse_mathml_tokens(mathml)).replace(" ", "")
+
+
+def _with_confirmed_mathml_regions(ocr: VisionOCRResult) -> VisionOCRResult:
+    """Attach MathML only when Mathpix returned one unambiguous block per line."""
+
+    if len(ocr.mathml_blocks) != len(ocr.detected_regions):
+        return ocr
+    regions: list[OCRTextRegion] = []
+    for region, mathml in zip(ocr.detected_regions, ocr.mathml_blocks):
+        if _normalised_mathml_tokens(mathml) != region.text.replace(" ", ""):
+            return ocr
+        regions.append(region.model_copy(update={"mathml": mathml}))
+    return ocr.model_copy(update={"detected_regions": regions})
+
+
+def _is_complete_correct_canvas(
+    ocr: VisionOCRResult | None,
+    correct_answer: str | None,
+) -> bool:
+    return (
+        ocr is not None
+        and not ocr.needs_clarification
+        and ocr.final_answer is not None
+        and normalize_exact_notation(ocr.final_answer)
+        == normalize_exact_notation(correct_answer or "")
+    )
+
+
+async def _canvas_evidence_for(request: InteractionRequest) -> _CanvasEvidence | None:
+    canvas_state = request.canvas_state
+    if canvas_state is None:
+        return None
+    settings = get_settings()
+    if len(canvas_state.snapshot_data_url) > settings.max_snapshot_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Canvas snapshot exceeds the {settings.max_snapshot_bytes} byte limit.",
+        )
+    if request.turn_id is None:
+        raise RuntimeError("validated interaction is missing turn_id")
+
+    snapshot_reference = build_reference(request.turn_id)
+    store_snapshot(snapshot_reference, canvas_state.snapshot_data_url)
+    started = perf_counter()
+    ocr = await get_adapters().vision.recognize(canvas_state.snapshot_data_url)
+    ocr = ocr.model_copy(update={"detected_regions": assign_step_ids(ocr.detected_regions)})
+    ocr = _with_confirmed_mathml_regions(ocr)
+    strokes_by_step = associate_strokes_with_steps(canvas_state.strokes, ocr.detected_regions)
+    spatial_tokens: list[SpatialMathToken] = []
+    for region in ocr.detected_regions:
+        if region.step_id is None or region.mathml is None:
+            continue
+        spatial_tokens.extend(
+            align_step_tokens(
+                region.step_id,
+                region.mathml,
+                region.text,
+                strokes_by_step.get(region.step_id, []),
+                region,
+            )
+        )
+    return _CanvasEvidence(
+        submission_id=request.turn_id,
+        snapshot_reference=snapshot_reference,
+        ocr=ocr,
+        spatial_tokens=spatial_tokens,
+        ocr_latency_ms=(perf_counter() - started) * 1000,
+    )
 
 
 def _is_wrong_evaluation(tutor: TutorResult) -> bool:
@@ -257,6 +338,38 @@ async def process_answer_with_session_event(
         )
 
     _, student, tutor = await run_tutor_pipeline(context)
+    if (
+        context.has_canvas_evidence
+        and tutor.mistake_classification is not None
+        and tutor.mistake_classification.status == "no_mistake"
+        and not context.canvas_solution_complete_candidate
+    ):
+        confirmation = "That step is correct. Keep going until you have the final answer."
+        return (
+            student,
+            tutor.model_copy(
+                update={
+                    "evaluation": "PARTIALLY_CORRECT",
+                    "response_strategy": "CONFIRM_CORRECT",
+                    "tutor_message": confirmation,
+                    "tutor_message_voice": confirmation,
+                    "attempt_increment": 0,
+                    "question_completed": False,
+                    "answer_value_confirmed": False,
+                    "recommended_conversation_action": "ACKNOWLEDGE_ANSWER",
+                }
+            ),
+            None,
+            None,
+            session,
+        )
+    if (
+        context.has_canvas_evidence
+        and tutor.mistake_classification is not None
+        and tutor.mistake_classification.status == "mistake_found"
+        and tutor.intent != "SUBMITTING_ANSWER"
+    ):
+        return student, tutor.model_copy(update={"attempt_increment": 0}), None, None, session
     scaffold_turn = session.current_scaffold_step_id is not None
     wrong_attempt_count = (
         session.wrong_attempt_count + 1
@@ -565,6 +678,38 @@ def _normalize_voice_transcript(transcript: str) -> str:
     normalized = re.sub(r"\bequals?\b", "=", normalized, flags=re.IGNORECASE)
     normalized = re.sub(r"\s*=\s*", " = ", normalized)
     return " ".join(normalized.split())
+
+
+_EXPLICIT_ASSIGNMENT = re.compile(
+    r"\b([A-Za-z])\s*=\s*(-?(?:\d+(?:\.\d*)?|\.\d+))\b"
+)
+_SPOKEN_NUMERIC_ANSWER = re.compile(
+    r"\b(?:got|answer\s*(?:=|is)?|solution\s*(?:=|is)?)\s*"
+    r"(-?(?:\d+(?:\.\d*)?|\.\d+))\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _spoken_answer_conflicts_with_canvas(
+    student_message: str,
+    canvas_final_answer: str | None,
+) -> bool:
+    """Detect a plainly stated numeric answer that disagrees with the board."""
+
+    if canvas_final_answer is None:
+        return False
+    normalized_message = _normalize_voice_transcript(student_message)
+    spoken = _EXPLICIT_ASSIGNMENT.search(normalized_message)
+    board = _EXPLICIT_ASSIGNMENT.search(canvas_final_answer)
+    if board is None:
+        return False
+    if spoken is not None:
+        return (
+            spoken.group(1).lower() == board.group(1).lower()
+            and spoken.group(2) != board.group(2)
+        )
+    numeric_answer = _SPOKEN_NUMERIC_ANSWER.search(normalized_message)
+    return numeric_answer is not None and numeric_answer.group(1) != board.group(2)
 
 
 def _is_acknowledgement(message: str, rules: ClassifierRulesConfig) -> bool:
@@ -1263,6 +1408,20 @@ def _conversation_state_for(
     return "ASKED_QUESTION", "ANSWER"
 
 
+def _may_force_complete_repeated_explanation(
+    current_phase: Phase,
+    answer_value_confirmed: bool,
+    explanation_request_count: int,
+) -> bool:
+    """Allow the legacy loop-breaker only outside evidence-driven guidance."""
+
+    return (
+        current_phase != "GUIDED_PRACTICE"
+        and answer_value_confirmed
+        and explanation_request_count >= 2
+    )
+
+
 def _stale_turn_response(session: SessionRecord) -> StaleTurnResponse:
     return StaleTurnResponse(
         status="STALE_TURN",
@@ -1289,6 +1448,12 @@ def _duplicate_turn_response(
             f"cached response is missing for duplicate session_id={session.session_id} "
             f"turn_id={request.turn_id}"
         )
+    fingerprint = interaction_payload_fingerprint_for(session.session_id, request.turn_id)
+    if fingerprint is not None and fingerprint != _request_fingerprint(request):
+        raise HTTPException(
+            status_code=409,
+            detail="turn_id was already accepted with different transcript or canvas evidence.",
+        )
     return response.model_copy(
         update={
             "status": "DUPLICATE_TURN",
@@ -1313,7 +1478,11 @@ def _turn_is_stale(request: InteractionRequest, session: SessionRecord) -> bool:
 
 
 def _response_from(
-    request: InteractionRequest,
+    session_id: str,
+    student_id: str,
+    turn_id: str,
+    interaction_type: str,
+    nudge_id: str | None,
     session: SessionRecord,
     message: str,
     message_voice: str,
@@ -1322,8 +1491,7 @@ def _response_from(
     session_summary: SessionSummary | None,
     conversation_action: ConversationAction,
     attempt_increment: int,
-    status: Literal["CLARIFICATION_REQUIRED", "NUDGE_SUPPRESSED"] | None,
-
+    status: Literal["CLARIFICATION_REQUIRED", "NUDGE_SUPPRESSED", "processed"] | None,
     retry_safe: bool | None,
     previous_phase: Phase | None = None,
 ) -> InteractionResponse:
@@ -1366,13 +1534,13 @@ def _response_from(
     )
     active_objective = session.active_teaching_objective
     nudge_delivery = (
-        nudge_delivery_for(session.session_id, request.nudge_id or request.turn_id)
-        if request.interaction_type in {"INACTIVITY_NUDGE", "NUDGE_PRESENTED"}
+        nudge_delivery_for(session.session_id, nudge_id or turn_id)
+        if interaction_type in {"INACTIVITY_NUDGE", "NUDGE_PRESENTED"}
         else None
     )
     return InteractionResponse(
-        session_id=request.session_id,
-        student_id=request.student_id,
+        session_id=session_id,
+        student_id=student_id,
         status=status,
         accepted_turn_id=session.last_processed_turn_id,
         interaction_state_version=session.interaction_state_version,
@@ -1446,8 +1614,19 @@ def _cache_response(
 ) -> InteractionResponse:
     if request.turn_id is None:
         raise RuntimeError("validated interaction is missing turn_id")
-    cache_interaction_response(request.session_id, request.turn_id, response)
+    cache_interaction_response(
+        request.session_id,
+        request.turn_id,
+        response,
+        _request_fingerprint(request),
+    )
     return response
+
+
+def _request_fingerprint(request: InteractionRequest) -> str:
+    payload = request.model_dump(mode="json", exclude_none=True)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 async def process_interaction(
@@ -1497,102 +1676,6 @@ def _active_scaffold(session: SessionRecord) -> ActiveScaffold | None:
         step_text=session.scaffold_steps[0],
         step_voice=None,
     )
-
-
-def _support_levels(session: SessionRecord) -> tuple[SupportUsed, SupportUsed]:
-    event = session.student_model_event
-    if event is None:
-        return "NONE", "NONE"
-    support = (
-        event.phase_payload.support_to_serve
-        if event.phase_payload is not None
-        else None
-    )
-    support_type = support.get("support_type") if support is not None else None
-    active: SupportUsed = (
-        support_type
-        if support_type in _SUPPORT_RANK
-        else "VISUAL_CUE"
-        if support_type == "HINT_AND_VISUAL_CUE"
-        else "NONE"
-    )
-    highest = max(
-        event.journey_state.phase_2_guided_learning.highest_support_used_by_skill.values(),
-        key=_SUPPORT_RANK.index,
-        default="NONE",
-    )
-    return active, highest
-
-
-def _misconception_evidence(session: SessionRecord) -> str | None:
-    if session.selected_error_code is None or session.student_model_event is None:
-        return None
-    for potential_error in _schema_question(session).tutor_view.potential_errors:
-        if potential_error.get("error_code") != session.selected_error_code:
-            continue
-        description = potential_error.get("error_description")
-        return description if isinstance(description, str) else None
-    return None
-
-
-def _generate_explain_again(session: SessionRecord) -> tuple[str, str]:
-    if session.current_question is None:
-        raise HTTPException(status_code=409, detail="No active question to explain.")
-    client = build_openai_ai_engine_client(get_settings())
-    if client is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Explain Again requires the configured Sanya LLM engine.",
-        )
-    active_support, highest_support = _support_levels(session)
-    cue = _schema_visual_cue(session.student_model_event)
-    response = client.generate_explain_again_message(
-        request=ExplainAgainRequest(
-            question=session.current_question,
-            generated_question_rubric=session.generated_question_rubric,
-            active_teaching_objective=session.active_teaching_objective,
-            first_unresolved_concept_id=(
-                session.active_teaching_objective.missing_concept_ids[0]
-                if session.active_teaching_objective is not None
-                and session.active_teaching_objective.missing_concept_ids
-                else None
-            ),
-            recent_conversation=[
-                ExplainAgainConversationMessage(role=item.role, content=item.content)
-                for item in session.conversation_history
-            ],
-            visible_visual_cue=(
-                AIVisibleVisualCue(
-                    show=cue.show,
-                    cue_id=cue.cue_type,
-                    cue_type=None,
-                    description=cue.description,
-                    actions=cue.actions,
-                )
-                if cue is not None
-                else None
-            ),
-
-
-
-            active_scaffold=_active_scaffold(session),
-            support_state=ExplainAgainSupportState(
-                active_support_level=active_support,
-                highest_support_used=highest_support,
-                support_reason_code=(
-                    session.student_model_event.routing.reason_code
-                    if session.student_model_event is not None
-                    else None
-                ),
-            ),
-            selected_error_code=session.selected_error_code,
-            misconception_evidence=_misconception_evidence(session),
-        ),
-    )
-
-    voice_msg = getattr(response, "tutor_message_voice_optimised", getattr(response, "tutor_message_voice", response.tutor_message))
-    return response.tutor_message, voice_msg
-
 
 
 def _claim_inactivity_nudge(
@@ -1716,17 +1799,21 @@ def _side_channel_response(
 ) -> InteractionResponse:
     updated_session = update_side_channel_state(session, state_updates)
     response = _response_from(
-        request,
-        updated_session,
-        message,
-        message_voice,
-        None,
-        updated_session.scaffold_steps,
-        None,
-        conversation_action,
-        0,
-        None,
-        True,
+        session_id=request.session_id,
+        student_id=request.student_id,
+        turn_id=request.turn_id or "TURN-0000",
+        interaction_type=request.interaction_type,
+        nudge_id=request.nudge_id,
+        session=updated_session,
+        message=message,
+        message_voice=message_voice,
+        visual_cue=None,
+        scaffold_steps=updated_session.scaffold_steps,
+        session_summary=None,
+        conversation_action=conversation_action,
+        attempt_increment=0,
+        status=None,
+        retry_safe=True,
     )
     return _cache_response(request, response)
 
@@ -1786,17 +1873,21 @@ def _nudge_response(
         state_updates,
     )
     response = _response_from(
-        request,
-        updated_session,
-        message,
-        message,
-        None,
-        updated_session.scaffold_steps,
-        None,
-        "WAIT_FOR_STUDENT",
-        0,
-        "NUDGE_SUPPRESSED" if status is None else None,
-        True,
+        session_id=request.session_id,
+        student_id=request.student_id,
+        turn_id=request.turn_id or "TURN-0000",
+        interaction_type=request.interaction_type,
+        nudge_id=request.nudge_id,
+        session=updated_session,
+        message=message,
+        message_voice=message,
+        visual_cue=None,
+        scaffold_steps=updated_session.scaffold_steps,
+        session_summary=None,
+        conversation_action="WAIT_FOR_STUDENT",
+        attempt_increment=0,
+        status="NUDGE_SUPPRESSED" if status is None else None,
+        retry_safe=True,
     )
     delivery = (
         NudgeDelivery(
@@ -2052,17 +2143,21 @@ def _explain_again_interaction_response(
         },
     )
     response = _response_from(
-        request,
-        updated_session,
-        result.tutor_message,
-        result.tutor_message_voice_optimised,
-        visual_cue,
-        updated_session.scaffold_steps,
-        None,
-        "ASK_QUESTION",
-        0,
-        None,
-        True,
+        session_id=request.session_id,
+        student_id=request.student_id,
+        turn_id=request.turn_id or "TURN-0000",
+        interaction_type=request.interaction_type,
+        nudge_id=request.nudge_id,
+        session=updated_session,
+        message=result.tutor_message,
+        message_voice=result.tutor_message_voice_optimised,
+        visual_cue=visual_cue,
+        scaffold_steps=updated_session.scaffold_steps,
+        session_summary=None,
+        conversation_action="ASK_QUESTION",
+        attempt_increment=0,
+        status=None,
+        retry_safe=True,
     ).model_copy(
         update={
             "guided_student_state": result.guided_student_state,
@@ -2123,15 +2218,7 @@ async def _process_interaction(
             _tutor_side_channel_updates(request, session, support_message),
         )
     if request.interaction_type == "EXPLAIN_AGAIN":
-        message, message_voice = _generate_explain_again(session)
-        return _side_channel_response(
-            request,
-            session,
-            message,
-            message_voice,
-            "ASK_QUESTION",
-            _tutor_side_channel_updates(request, session, message),
-        )
+        return _explain_again_interaction_response(request, session)
     if request.interaction_type == "INACTIVITY_NUDGE":
         nudge_res = _claim_inactivity_nudge(request, session)
         return nudge_res
@@ -2142,11 +2229,17 @@ async def _process_interaction(
 
     student_message = _student_message_from(request)
     rules: ClassifierRulesConfig = load_classifier_rules()
+    canvas_evidence = await _canvas_evidence_for(request)
 
+    canvas_complete_correct = _is_complete_correct_canvas(
+        canvas_evidence.ocr if canvas_evidence is not None else None,
+        session.correct_answer,
+    )
     if (
         request.input_source == "VOICE"
         and request.transcript_confidence is not None
         and request.transcript_confidence < rules.low_transcript_confidence_threshold
+        and not canvas_complete_correct
     ):
         clarification_history = _updated_conversation_history(
             session.conversation_history,
@@ -2162,8 +2255,8 @@ async def _process_interaction(
             session.hint_count,
             session.current_phase,
             request.transcript_confidence,
-            request.canvas_snapshot_id,
-            None,
+            canvas_evidence.submission_id if canvas_evidence is not None else request.canvas_snapshot_id,
+            canvas_evidence.ocr if canvas_evidence is not None else None,
             False,
             False,
             [],
@@ -2181,17 +2274,37 @@ async def _process_interaction(
         return _cache_response(
             request,
             _response_from(
-                request,
-                updated_session,
-                _LOW_CONFIDENCE_MESSAGE,
-                _LOW_CONFIDENCE_MESSAGE,
-                None,
-                [],
-                None,
-                "REQUEST_CLARIFICATION",
-                0,
-                "CLARIFICATION_REQUIRED",
-                None,
+                session_id=request.session_id,
+                student_id=request.student_id,
+                turn_id=request.turn_id or "TURN-0000",
+                interaction_type=request.interaction_type,
+                nudge_id=request.nudge_id,
+                session=updated_session,
+                message=_LOW_CONFIDENCE_MESSAGE,
+                message_voice=_LOW_CONFIDENCE_MESSAGE,
+                visual_cue=None,
+                scaffold_steps=[],
+                session_summary=None,
+                conversation_action="REQUEST_CLARIFICATION",
+                attempt_increment=0,
+                status="CLARIFICATION_REQUIRED",
+                retry_safe=None,
+            ).model_copy(
+                update={
+                    "ocr": canvas_evidence.ocr if canvas_evidence is not None else None,
+                    "snapshot_reference": (
+                        canvas_evidence.snapshot_reference
+                        if canvas_evidence is not None
+                        else None
+                    ),
+                    "is_canvas_solution_correct": (
+                        False
+                        if canvas_evidence is not None
+                        and not canvas_evidence.ocr.needs_clarification
+                        else None
+                    ),
+                    "feedback_type": "CLARIFICATION",
+                }
             ),
         )
 
@@ -2219,7 +2332,78 @@ async def _process_interaction(
         rules.conversation_rules.max_recent_messages,
     )
     canvas_submission = get_canvas_submission(session, request.canvas_snapshot_id)
-    ocr = canvas_submission.ocr if canvas_submission is not None else None
+    ocr = (
+        canvas_evidence.ocr
+        if canvas_evidence is not None
+        else canvas_submission.ocr
+        if canvas_submission is not None
+        else None
+    )
+    canvas_solution_complete_candidate = _is_complete_correct_canvas(
+        ocr,
+        session.correct_answer,
+    )
+    if (
+        canvas_evidence is not None
+        and canvas_solution_complete_candidate
+        and _spoken_answer_conflicts_with_canvas(student_message, ocr.final_answer)
+    ):
+        message = (
+            "Your board shows a correct final answer, but I heard a different answer. "
+            "Which answer would you like me to check?"
+        )
+        updated_session = update_interaction_state(
+            request.session_id,
+            request.student_id,
+            session,
+            session.current_phase,
+            session.hint_count,
+            session.current_phase,
+            request.transcript_confidence,
+            canvas_evidence.submission_id,
+            ocr,
+            False,
+            False,
+            [],
+            {
+                "attempt_count": session.attempt_count,
+                "question_completed": session.question_completed,
+                "conversation_history": _updated_conversation_history(
+                    session.conversation_history,
+                    student_message,
+                    message,
+                    rules.conversation_rules.max_recent_messages,
+                ),
+                **_turn_updates(request, "REQUESTED_CLARIFICATION", "CLARIFICATION"),
+            },
+        )
+        return _cache_response(
+            request,
+            _response_from(
+                session_id=request.session_id,
+                student_id=request.student_id,
+                turn_id=request.turn_id or "TURN-0000",
+                interaction_type=request.interaction_type,
+                nudge_id=request.nudge_id,
+                session=updated_session,
+                message=message,
+                message_voice=message,
+                visual_cue=None,
+                scaffold_steps=[],
+                session_summary=None,
+                conversation_action="REQUEST_CLARIFICATION",
+                attempt_increment=0,
+                status="CLARIFICATION_REQUIRED",
+                retry_safe=None,
+            ).model_copy(
+                update={
+                    "ocr": ocr,
+                    "snapshot_reference": canvas_evidence.snapshot_reference,
+                    "is_canvas_solution_correct": True,
+                    "feedback_type": "CLARIFICATION",
+                }
+            ),
+        )
     scaffold_turn = (
         request.interaction_type == "ANSWER_SUBMISSION"
         and session.current_scaffold_step_id is not None
@@ -2287,7 +2471,68 @@ async def _process_interaction(
         detected_steps=ocr.detected_steps if ocr is not None else [],
         ocr_confidence=ocr.confidence if ocr is not None else None,
         canvas_regions=ocr.detected_regions if ocr is not None else [],
+        canvas_mathml_blocks=ocr.mathml_blocks if ocr is not None else [],
+        spatial_tokens=(canvas_evidence.spatial_tokens if canvas_evidence is not None else []),
+        has_canvas_evidence=canvas_evidence is not None,
+        canvas_solution_complete_candidate=canvas_solution_complete_candidate,
     )
+    if ocr is not None and ocr.needs_clarification:
+        message = "I’m having trouble reading your working on the board. Please rewrite it clearly and try again."
+        updated_session = update_interaction_state(
+            request.session_id,
+            request.student_id,
+            session,
+            session.current_phase,
+            session.hint_count,
+            session.current_phase,
+            request.transcript_confidence,
+            canvas_evidence.submission_id if canvas_evidence is not None else request.canvas_snapshot_id,
+            ocr,
+            False,
+            False,
+            [],
+            {
+                "attempt_count": session.attempt_count,
+                "question_completed": session.question_completed,
+                "conversation_history": _updated_conversation_history(
+                    session.conversation_history,
+                    student_message,
+                    message,
+                    rules.conversation_rules.max_recent_messages,
+                ),
+                **_turn_updates(request, "REQUESTED_CLARIFICATION", "CLARIFICATION"),
+            },
+        )
+        return _cache_response(
+            request,
+            _response_from(
+                session_id=request.session_id,
+                student_id=request.student_id,
+                turn_id=request.turn_id or "TURN-0000",
+                interaction_type=request.interaction_type,
+                nudge_id=request.nudge_id,
+                session=updated_session,
+                message=message,
+                message_voice=message,
+                visual_cue=None,
+                scaffold_steps=[],
+                session_summary=None,
+                conversation_action="REQUEST_CLARIFICATION",
+                attempt_increment=0,
+                status="CLARIFICATION_REQUIRED",
+                retry_safe=None,
+            ).model_copy(
+                update={
+                    "ocr": ocr,
+                    "snapshot_reference": (
+                        canvas_evidence.snapshot_reference
+                        if canvas_evidence is not None
+                        else None
+                    ),
+                    "feedback_type": "CLARIFICATION",
+                }
+            ),
+        )
     safety_check = await adapters.safety.check(context)
     if not safety_check.passed:
         fallback = safety_check.safe_fallback_message or "Let's pause for a moment."
@@ -2323,17 +2568,21 @@ async def _process_interaction(
         return _cache_response(
             request,
             _response_from(
-                request,
-                updated_session,
-                fallback,
-                fallback,
-                None,
-                [],
-                None,
-                "WAIT_FOR_STUDENT",
-                0,
-                None,
-                None,
+                session_id=request.session_id,
+                student_id=request.student_id,
+                turn_id=request.turn_id or "TURN-0000",
+                interaction_type=request.interaction_type,
+                nudge_id=request.nudge_id,
+                session=updated_session,
+                message=fallback,
+                message_voice=fallback,
+                visual_cue=None,
+                scaffold_steps=[],
+                session_summary=None,
+                conversation_action="WAIT_FOR_STUDENT",
+                attempt_increment=0,
+                status=None,
+                retry_safe=None,
             ),
         )
 
@@ -2492,11 +2741,12 @@ async def _process_interaction(
             if tutor.guided_student_state == "CORRECT"
             else session.wrong_attempt_count
         ),
-        "selected_error_code": (
-            tutor.selected_error_code
-            if tutor.selected_error_code is not None
-            else session.selected_error_code
-        ),
+        # A misconception belongs to the answer that demonstrated it. Keeping
+        # the previous code when the current evaluation returns none makes a
+        # corrected answer inherit stale feedback such as "you multiplied".
+        # Side-channel turns do not pass through this state update, so clearing
+        # here cannot affect Explain Again or inactivity requests.
+        "selected_error_code": tutor.selected_error_code,
         **_schema_scaffold_state(schema_content_response),
         **scaffold_turn_updates,
     }
@@ -2516,25 +2766,27 @@ async def _process_interaction(
         state_updates["active_teaching_objective"] = None
         state_updates["explanation_request_count"] = 0
 
-    # A rejected explanation must not loop forever. The evaluator accepts
-    # concrete wordings ("I subtracted 6 from both sides") but can reject a
-    # child's generic-but-honest ones ("I moved it to the other side") — and
-    # PARTIAL turns carry attempt_increment=0, so no counter ever advanced and
-    # no support ever escalated. Live on 31 Jul: 29 consecutive
-    # REQUEST_EXPLANATION turns on one question; the session was unwinnable.
-    # After two rejected asks the third would start the loop, so accept the
-    # student's reasoning and move on — the answer VALUE was already right, and
-    # the question_advanced block below supplies the next-question message.
-    # Schema-managed turns are untouched: there the Student Model owns
-    # progression.
+    # Never turn repeated unresolved reasoning into a correct completion during
+    # Guided Practice. A previous loop-breaker advanced after three explanation
+    # requests even when answer_value_confirmed was false, allowing an incorrect
+    # response to move to the next question. Guided progression must remain
+    # evidence-driven; repetition alone is not evidence.
     if conversation_action == "REQUEST_EXPLANATION" and schema_response is None:
-        if session.explanation_request_count >= 2:
+        answer_value_confirmed = (
+            session.answer_value_confirmed or tutor.answer_value_confirmed
+        )
+        if _may_force_complete_repeated_explanation(
+            turn_session.current_phase,
+            answer_value_confirmed,
+            session.explanation_request_count,
+        ):
             conversation_action = "ADVANCE_TO_NEXT_QUESTION"
             state_updates["explanation_request_count"] = 0
             state_updates["question_completed"] = True
         else:
-            state_updates["explanation_request_count"] = (
-                session.explanation_request_count + 1
+            state_updates["explanation_request_count"] = min(
+                session.explanation_request_count + 1,
+                2,
             )
     elif session.explanation_request_count:
         state_updates["explanation_request_count"] = 0
@@ -2570,8 +2822,31 @@ async def _process_interaction(
         and resulting_question.strip() != ""
     )
     if question_advanced:
-        tutor_message = rules.messages.NEXT_QUESTION.format(
-            question=resulting_question.strip()
+        resulting_question_type = state_updates.get(
+            "question_type",
+            turn_session.question_type,
+        )
+        guided_question_type: QuestionType | None = (
+            cast(QuestionType, resulting_question_type)
+            if resulting_question_type in {
+                "SINGLE_CHOICE",
+                "SHORT_RESPONSE",
+                "MULTI_PART_SHORT_RESPONSE",
+                "CHOICE_WITH_EXPLANATION",
+                "TRUE_FALSE_WITH_EXPLANATION",
+            }
+            else None
+        )
+        tutor_message = (
+            guided_question_opening(
+                resulting_question,
+                guided_question_type,
+                "Nice work. Here is the next question.",
+            )
+            if session.current_phase == "GUIDED_PRACTICE"
+            else rules.messages.NEXT_QUESTION.format(
+                question=resulting_question.strip()
+            )
         )
         tutor_message_voice = tutor_message
         conversation_action = "ADVANCE_TO_NEXT_QUESTION"
@@ -2604,8 +2879,8 @@ async def _process_interaction(
         next_hint_count,
         next_phase,
         request.transcript_confidence,
-        request.canvas_snapshot_id,
-        None,
+        canvas_evidence.submission_id if canvas_evidence is not None else request.canvas_snapshot_id,
+        ocr,
         visual_cue is not None,
         len(scaffold_steps) > 0,
         scaffold_steps,
@@ -2613,17 +2888,21 @@ async def _process_interaction(
     )
 
     response = _response_from(
-        request,
-        updated_session,
-        tutor_message,
-        tutor_message_voice,
-        visual_cue,
-        scaffold_steps,
-        None,
-        conversation_action,
-        effective_attempt_increment,
-        None,
-        None,
+        session_id=request.session_id,
+        student_id=request.student_id,
+        turn_id=request.turn_id or "TURN-0000",
+        interaction_type=request.interaction_type,
+        nudge_id=request.nudge_id,
+        session=updated_session,
+        message=tutor_message,
+        message_voice=tutor_message_voice,
+        visual_cue=visual_cue,
+        scaffold_steps=scaffold_steps,
+        session_summary=None,
+        conversation_action=conversation_action,
+        attempt_increment=effective_attempt_increment,
+        status=None,
+        retry_safe=None,
         previous_phase=session.current_phase if new_phase is not None else None,
     )
     support_served = (
@@ -2660,6 +2939,46 @@ async def _process_interaction(
             "intervention_triggered": (
                 _is_wrong_evaluation(tutor)
                 and updated_session.wrong_attempt_count >= 4
+            ),
+            "ocr": ocr,
+            "snapshot_reference": (
+                canvas_evidence.snapshot_reference
+                if canvas_evidence is not None
+                else None
+            ),
+            "canvas_draw": (
+                plan_canvas_draw(
+                    tutor,
+                    ocr.detected_regions,
+                    canvas_evidence.spatial_tokens if canvas_evidence is not None else None,
+                )
+                if ocr is not None
+                else []
+            ),
+            "is_canvas_solution_correct": (
+                True
+                if canvas_evidence is not None
+                and canvas_solution_complete_candidate
+                and tutor.evaluation == "CORRECT"
+                else False
+                if canvas_evidence is not None
+                else None
+            ),
+            "advance_to_next_question": (
+                schema_response is not None
+                and conversation_action == "ADVANCE_TO_NEXT_QUESTION"
+            ),
+            "feedback_type": (
+                "PRAISE"
+                if tutor.evaluation == "CORRECT"
+                or (
+                    canvas_evidence is not None
+                    and tutor.mistake_classification is not None
+                    and tutor.mistake_classification.status == "no_mistake"
+                )
+                else "CORRECTION"
+                if tutor.evaluation in {"INCORRECT", "PARTIALLY_CORRECT"}
+                else "HINT"
             ),
         }
     )
