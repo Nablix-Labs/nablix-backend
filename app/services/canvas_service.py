@@ -28,6 +28,7 @@ from app.services.interaction_service import (
     _initialize_restored_schema_phase,
     _phase_2_prompt_context,
     _schema_question,
+    _guided_rescue,
     _scaffold_evaluation_context,
     process_answer_with_session_event,
     _response_from,
@@ -115,7 +116,7 @@ async def submit_canvas(
         access_token,
     )
     schema_question = _schema_question(session)
-    previous_session = session
+    turn_session = session
 
     submission_id = request.turn_id or uuid4().hex
     snapshot_reference = build_reference(submission_id)
@@ -189,13 +190,15 @@ async def submit_canvas(
     if request.submission_role == "VOICE_ATTACHMENT":
         tutor = _attachment_result(ocr)
         student_result = None
+        schema_content_response = None
         updated_session = session
     elif ocr.needs_clarification or ocr.confidence < settings.min_ocr_confidence_threshold:
         tutor = _clarification_result(ocr)
         student_result = None
+        schema_content_response = None
         updated_session = session
     else:
-        student_result, tutor, _schema_content, _schema_response, updated_session = (
+        student_result, tutor, schema_content_response, _schema_response, updated_session = (
             await process_answer_with_session_event(
                 context,
                 session,
@@ -241,11 +244,12 @@ async def submit_canvas(
             request.session_id,
             request.student_id,
             updated_session,
+            turn_session,
             record,
             updated_history,
             student_result,
         )
-    phase_changed = updated_session.current_phase != previous_session.current_phase
+    phase_changed = updated_session.current_phase != turn_session.current_phase
     status_to_return = (
         "processed"
         if request.submission_role == "VOICE_ATTACHMENT"
@@ -269,7 +273,7 @@ async def submit_canvas(
         attempt_increment=tutor.attempt_increment,
         status=status_to_return,
         retry_safe=None,
-        previous_phase=previous_session.current_phase if phase_changed else None,
+        previous_phase=turn_session.current_phase if phase_changed else None,
     )
     response.submission_id = submission_id
     response.snapshot_reference = snapshot_reference
