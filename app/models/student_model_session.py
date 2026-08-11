@@ -250,6 +250,7 @@ class PublicStudentModelPhasePayload(BaseModel):
     payload_type: str
     question_set: PublicQuestionSet | None = None
     orientation_bundle: OrientationBundle | None = None
+    review_summary: dict[str, object] | None = None
 
 
 class PublicStudentModelJourney(BaseModel):

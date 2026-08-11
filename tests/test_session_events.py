@@ -11,6 +11,10 @@ from app.main import app
 from app.ai_engine.classifier_config import load_classifier_rules
 from app.models.adapters import TutorResult
 from app.models.guided_learning import GuidedRescue
+from app.models.student_model_session import (
+    PublicStudentModelPhasePayload,
+    StudentModelPhasePayload,
+)
 from app.services import interaction_service, session_service
 
 
@@ -52,6 +56,21 @@ def test_unresolved_partial_does_not_emit_an_incorrect_attempt() -> None:
 
     assert interaction_service._guided_attempt_event_type(unresolved, rules) is None
     assert interaction_service._guided_attempt_event_type(defence, rules) is None
+
+
+def test_public_review_payload_preserves_review_summary() -> None:
+    payload = StudentModelPhasePayload(
+        phase="REVIEW",
+        payload_type="REVIEW_SUMMARY",
+        review_summary={"mastery_status": "MASTERED", "attempts": 3},
+    )
+
+    public_payload = PublicStudentModelPhasePayload.model_validate(payload)
+
+    assert public_payload.review_summary == {
+        "mastery_status": "MASTERED",
+        "attempts": 3,
+    }
 
 
 @pytest.mark.parametrize("support_type", ["HINT", "VISUAL_CUE", "SCAFFOLD"])
