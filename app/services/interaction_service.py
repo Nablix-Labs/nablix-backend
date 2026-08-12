@@ -32,6 +32,7 @@ from app.ai_engine.schemas import (
 )
 
 from app.core.config import get_settings
+from app.core.exceptions import JourneyVersionConflict
 from app.core.logger import logger
 from app.models.adapters import (
     AdapterContext,
@@ -106,6 +107,7 @@ from app.services.session_service import (
     last_interaction_response_for,
     nudge_deliveries_for_tutor_turn,
     nudge_delivery_for,
+    reconcile_journey_conflict,
     store_nudge_delivery,
     update_nudge_delivery_status,
     update_side_channel_state,
@@ -595,6 +597,7 @@ async def process_answer_with_session_event(
                     context.message
                     if escalation_type == "GUIDED_SUPPORT_ESCALATION_REQUIRED"
                     and wrong_four_escalation
+                    and escalation_error_code is not None
                     else None
                 ),
                 error_code=escalation_error_code,
@@ -1854,7 +1857,11 @@ async def process_interaction(
     access_token: str,
 ) -> InteractionResponse | StaleTurnResponse:
     async with interaction_lock_for(request.session_id):
-        response = await _process_interaction(request, access_token)
+        try:
+            response = await _process_interaction(request, access_token)
+        except JourneyVersionConflict as conflict:
+            reconcile_journey_conflict(request.session_id, request.student_id, conflict)
+            raise
     logger.info(
         "interaction_turn_completed",
         extra={
@@ -3375,6 +3382,12 @@ async def _process_interaction(
                 ]
                 if _is_support_failure(tutor)
                 and updated_session.wrong_attempt_count > 0
+                and not (
+                    updated_session.wrong_attempt_count >= 4
+                    and schema_content_response is not None
+                    and schema_content_response.routing.reason_code
+                    == "GUIDED_SCAFFOLD_REQUIRED"
+                )
                 else schema_content_response.routing.reason_code
                 if support_served is not None
                 else None
@@ -3384,6 +3397,9 @@ async def _process_interaction(
             "intervention_triggered": (
                 _is_support_failure(tutor)
                 and updated_session.wrong_attempt_count >= 4
+                and schema_content_response is not None
+                and schema_content_response.routing.reason_code
+                != "GUIDED_SCAFFOLD_REQUIRED"
             ),
             "ocr": ocr,
             "snapshot_reference": (
