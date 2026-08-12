@@ -4,10 +4,12 @@ from typing import TypedDict
 from uuid import uuid4
 
 from fastapi import HTTPException
+from pydantic import ValidationError
 from typing_extensions import NotRequired
 
 from app.adapters.provider import get_adapters
 from app.core.config import get_settings
+from app.core.exceptions import JourneyVersionConflict
 from app.core.logger import logger
 from app.models.adapters import ConversationMessage, StudentModelResult, VisionOCRResult
 from app.models.canvas import CanvasSubmissionRecord
@@ -39,6 +41,7 @@ from app.models.student_model_session import (
     OrientationCompletedEvent,
     QuestionType,
     SessionOpenedEvent,
+    StudentModelJourneyState,
     StudentModelPhasePayload,
     StudentModelPhase,
     StudentModelQuestion,
@@ -287,6 +290,48 @@ def _get_owned_session_for_turn(
             detail="Schema 3.0 session state is required.",
         )
     return session
+
+
+def reconcile_journey_conflict(
+    session_id: str,
+    student_id: str,
+    conflict: JourneyVersionConflict,
+) -> None:
+    session = _sessions.get(session_id)
+    if session is None or session.student_id != student_id:
+        return
+    event = session.student_model_event
+    if event is None or not isinstance(conflict.conflict_detail, dict):
+        return
+    raw_journey = conflict.conflict_detail.get(
+        "current_journey_state",
+        conflict.conflict_detail.get("journey_state"),
+    )
+    if not isinstance(raw_journey, dict):
+        return
+    try:
+        journey = StudentModelJourneyState.model_validate(raw_journey)
+    except ValidationError:
+        return
+    if (
+        journey.student_id != student_id
+        or journey.topic_id != event.journey_state.topic_id
+        or journey.version <= event.journey_state.version
+    ):
+        return
+    _sessions[session_id] = session.model_copy(
+        update={
+            "student_model_event": event.model_copy(
+                update={"journey_state": journey, "phase_payload": None}
+            ),
+            "current_phase": PHASE_FROM_STUDENT_MODEL[journey.current_phase],
+            "current_question": None,
+            "question_id": None,
+            "question_type": None,
+            "correct_answer": None,
+            "active_student_model_question": None,
+        }
+    )
 
 
 async def start_session(

@@ -32,7 +32,6 @@ from app.models.guided_learning import (
     GuidedStudentState,
     EvaluationReasonCode,
     PrerequisiteRepair,
-    WrongEscalationCode,
 )
 from app.models.session import (
     CanvasState,
@@ -46,7 +45,6 @@ from app.models.student_model_session import (
     QuestionType,
     StudentModelCoreState,
     SupportUsed,
-    RoutingReasonCode,
 )
 
 
@@ -166,8 +164,8 @@ class InteractionResponse(BaseModel):
     first_unresolved_concept_id: str | None = None
     selected_error_code: str | None = None
     evaluation_reason_code: EvaluationReasonCode | None = None
-    routing_reason_code: RoutingReasonCode | None = None
-    support_reason_code: WrongEscalationCode | RoutingReasonCode | None = None
+    routing_reason_code: str | None = None
+    support_reason_code: str | None = None
     support_served_this_turn: SupportUsed | None = None
     active_support_level: SupportUsed = "NONE"
     highest_support_used: SupportUsed = "NONE"
